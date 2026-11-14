@@ -16,7 +16,8 @@ use winperf_core::inventory::{
     BackgroundClassifier, CachedVerifier, ExecutableClassifier, SignatureVerifier, discover,
 };
 use winperf_core::network::NetworkStatus;
-use winperf_storage::{ConfigLocation, resolve_config_location, resolve_db_path};
+use winperf_core::time::unix_millis_now;
+use winperf_storage::{ConfigLocation, Database, resolve_config_location, resolve_db_path};
 use winperf_windows::{
     EtwNetworkCollector, WinTrustVerifier, WindowsMetricsSource, WindowsProcessSource,
     WindowsRegistry, WindowsSystemSource, WindowsVersionReader,
@@ -62,6 +63,11 @@ enum Command {
         #[command(subcommand)]
         action: SystemAction,
     },
+    /// Baseline profiles: what is normal for each executable and application
+    Baseline {
+        #[command(subcommand)]
+        action: BaselineAction,
+    },
     /// Show or create the configuration file
     Config {
         #[command(subcommand)]
@@ -92,6 +98,18 @@ enum Command {
         /// Frame height for --snapshot
         #[arg(long, default_value_t = 24)]
         height: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum BaselineAction {
+    /// Recompute the baselines from the stored samples now (every configured window)
+    Update,
+    /// Show the stored baselines of one window
+    List {
+        /// Window length in hours (default: the shortest configured window)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        window: Option<u32>,
     },
 }
 
@@ -274,7 +292,14 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                     Err(status) => eprintln!("winperf: {}", status.describe()),
                 }
             }
-            commands::monitor::run(
+            // Baselines are recomputed in the background on their own connection.
+            let schedule = commands::baseline::spawn_schedule(
+                db_path.clone(),
+                config.baseline.windows_hours.clone(),
+                Duration::from_secs(u64::from(config.baseline.recompute_minutes) * 60),
+                Arc::clone(&stop),
+            );
+            let result = commands::monitor::run(
                 metrics,
                 &db_path,
                 classifier,
@@ -282,9 +307,28 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 ticks,
                 &stop,
                 &mut std::io::stdout().lock(),
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            );
+            // A run that ended by itself (--ticks) never set the flag; stop the schedule too.
+            stop.store(true, Ordering::Relaxed);
+            let _ = schedule.join();
+            result.map(|_| ()).map_err(|e| e.to_string())
+        }
+        Command::Baseline { action } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let windows = &config.baseline.windows_hours;
+            let mut out = std::io::stdout().lock();
+            match action {
+                BaselineAction::Update => {
+                    let mut db = Database::open(&db_path).map_err(|e| e.to_string())?;
+                    commands::baseline::update(&mut db, windows, unix_millis_now(), &mut out)
+                        .map_err(|e| e.to_string())
+                }
+                BaselineAction::List { window } => {
+                    let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
+                    let window = window.unwrap_or_else(|| windows.first().copied().unwrap_or(1));
+                    commands::baseline::list(&db, window, &mut out).map_err(io)
+                }
+            }
         }
         Command::Process {
             action:

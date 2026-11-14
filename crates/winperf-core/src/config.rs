@@ -92,6 +92,8 @@ impl DetectionConfig {
 pub struct BaselineConfig {
     /// Rolling baseline windows in hours (short, medium, long), strictly increasing.
     pub windows_hours: Vec<u32>,
+    /// How often a running monitor recomputes the baselines, in minutes.
+    pub recompute_minutes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -132,6 +134,7 @@ impl Default for BaselineConfig {
     fn default() -> Self {
         Self {
             windows_hours: vec![1, 24, 168],
+            recompute_minutes: 15,
         }
     }
 }
@@ -198,6 +201,8 @@ sensitivity = "normal"
 [baseline]
 # Rolling baseline windows in hours: short, medium, long (strictly increasing).
 windows_hours = [1, 24, 168]
+# How often a running `monitor run` recomputes the baselines, in minutes (1 to 1440).
+recompute_minutes = 15
 "#;
 
 impl Config {
@@ -247,6 +252,12 @@ impl Config {
                     "baseline.windows_hours must be strictly increasing (got {windows:?})"
                 ));
             }
+        }
+        if !(1..=1440).contains(&self.baseline.recompute_minutes) {
+            problems.push(format!(
+                "baseline.recompute_minutes must be between 1 and 1440 (got {})",
+                self.baseline.recompute_minutes
+            ));
         }
         if let Some(db) = &self.storage.database
             && db.as_os_str().is_empty()
@@ -450,6 +461,17 @@ mod tests {
             );
         }
         assert!(Config::from_toml_str("[baseline]\nwindows_hours = [1]\n").is_ok());
+    }
+
+    #[test]
+    fn baseline_recompute_interval_is_range_checked() {
+        for bad in [0, 1441] {
+            let text = format!("[baseline]\nrecompute_minutes = {bad}\n");
+            assert!(Config::from_toml_str(&text).is_err(), "{bad}");
+        }
+        let c = Config::from_toml_str("[baseline]\nrecompute_minutes = 30\n").unwrap();
+        assert_eq!(c.baseline.recompute_minutes, 30);
+        assert_eq!(Config::default().baseline.recompute_minutes, 15);
     }
 
     #[test]

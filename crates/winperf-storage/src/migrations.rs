@@ -27,6 +27,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0005_samples_time_index",
         include_str!("../migrations/0005_samples_time_index.sql"),
     ),
+    (
+        "0006_baseline_profiles",
+        include_str!("../migrations/0006_baseline_profiles.sql"),
+    ),
 ];
 
 /// Highest schema version this build understands.

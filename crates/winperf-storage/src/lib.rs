@@ -13,7 +13,7 @@ pub use paths::{
     ConfigLocation, ENV_CONFIG, ENV_DB, config_location, default_db_path, resolve_config_location,
     resolve_db_path,
 };
-pub use repo::FileIdentity;
+pub use repo::{FileIdentity, ListedBaseline, RecomputeReport, StoredBaseline};
 pub use sink::DbSink;
 
 /// Crate name, used by front ends for diagnostics.
