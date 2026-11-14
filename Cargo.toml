@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/winperf-core",
+    "crates/winperf-windows",
+    "crates/winperf-storage",
+    "crates/winperf-cli",
+    "crates/winperf-service",
+    "crates/winperf-report",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

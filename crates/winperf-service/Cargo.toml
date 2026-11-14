@@ -1,0 +1,19 @@
+[package]
+name = "winperf-service"
+description = "Windows service host running the shared monitoring engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "winperf-service"
+path = "src/main.rs"
+
+[dependencies]
+winperf-core = { path = "../winperf-core" }
+winperf-windows = { path = "../winperf-windows" }
+winperf-storage = { path = "../winperf-storage" }
+
+[lints]
+workspace = true

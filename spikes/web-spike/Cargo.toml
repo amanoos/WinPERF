@@ -1,0 +1,12 @@
+[package]
+name = "web-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of the product workspace.
+[workspace]
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

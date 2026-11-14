@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WinPerf spike</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="min-h-full bg-slate-100 text-slate-900">
+  <header class="bg-slate-900 px-6 py-4 text-white">
+    <h1 class="text-xl font-semibold">WinPerf <span class="text-slate-400">spike</span></h1>
+  </header>
+  <main class="mx-auto max-w-5xl space-y-6 p-6">
+    <section class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+      <div class="rounded-lg bg-white p-4 shadow"><p class="text-sm text-slate-500">CPU</p><p class="text-3xl font-bold">23%</p></div>
+      <div class="rounded-lg bg-white p-4 shadow"><p class="text-sm text-slate-500">Memory</p><p class="text-3xl font-bold">61%</p></div>
+      <div class="rounded-lg bg-amber-100 p-4 shadow"><p class="text-sm text-amber-800">Active anomalies</p><p class="text-3xl font-bold text-amber-900">2</p></div>
+    </section>
+    <section class="rounded-lg bg-white p-4 shadow">
+      <h2 class="mb-2 font-medium">CPU over time (sample data)</h2>
+      <div id="chart" class="h-72 w-full"></div>
+    </section>
+  </main>
+  <script src="/echarts.min.js"></script>
+  <script>
+    const chart = echarts.init(document.getElementById('chart'));
+    chart.setOption({
+      tooltip: { trigger: 'axis' },
+      xAxis: { type: 'category', data: ['0','1','2','3','4','5','6','7','8','9'] },
+      yAxis: { type: 'value', max: 100 },
+      series: [{ type: 'line', smooth: true, areaStyle: {}, data: [12,18,15,40,72,68,30,22,19,23] }]
+    });
+    addEventListener('resize', () => chart.resize());
+  </script>
+</body>
+</html>

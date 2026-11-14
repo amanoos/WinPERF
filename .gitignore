@@ -1,0 +1,6 @@
+/target
+target/
+spikes/web-spike/vendor/tailwindcss.exe
+*.db
+*.db-wal
+*.db-shm
