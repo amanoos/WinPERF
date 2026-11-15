@@ -324,3 +324,48 @@ async fn every_response_forbids_loading_anything_from_elsewhere() {
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
 }
+
+#[tokio::test]
+async fn rankings_average_over_the_period_and_flag_what_was_not_measured() {
+    let s = Scratch::new();
+    seed(&s.db());
+    let app = app(settings(s.db(), None));
+    let now = unix_millis_now();
+    let range = format!("from_ms={}&to_ms={}", now - 700_000, now + 1);
+
+    let (code, cpu) = local(&app, &format!("/api/rankings?metric=cpu&{range}")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(cpu["unit"], "percent");
+    assert_eq!(cpu["group"], "process");
+    assert_eq!(cpu["available"], true);
+    assert_eq!(cpu["ticks"], 120);
+    let rows = cpu["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["name"], "busy.exe");
+    assert_eq!(rows[0]["current"], 60.0);
+    assert_eq!(rows[0]["peak"], 60.0);
+    assert_eq!(rows[0]["average"], 60.0 / 120.0, "one tick of 120 counts");
+    assert_eq!(rows[1]["name"], "idle.exe");
+
+    let (_, mem) = local(
+        &app,
+        &format!("/api/rankings?metric=memory&group=application&{range}"),
+    )
+    .await;
+    assert_eq!(mem["unit"], "bytes");
+    assert_eq!(mem["group"], "application");
+    assert_eq!(mem["rows"][0]["peak"], 1_048_576.0);
+
+    let (code, net) = local(&app, &format!("/api/rankings?metric=net_rx&{range}")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(net["available"], false, "never measured is not zero");
+    assert!(net["rows"].as_array().unwrap().is_empty());
+    assert!(net["note"].as_str().unwrap().contains("administrator"));
+
+    let (_, one) = local(&app, &format!("/api/rankings?metric=cpu&limit=1&{range}")).await;
+    assert_eq!(one["rows"].as_array().unwrap().len(), 1);
+
+    for bad in ["metric=gpu", "group=team", "from_ms=9&to_ms=9"] {
+        let (code, _) = local(&app, &format!("/api/rankings?{bad}")).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}

@@ -48,6 +48,18 @@
       <div class="rounded-lg bg-white p-4 shadow"><h2 class="mb-1 font-medium">Network</h2><div id="chart-net" class="h-56 w-full"></div></div>
     </section>
 
+    <section aria-label="Rankings">
+      <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-lg font-semibold">Biggest users over the selected range</h2>
+        <div class="flex gap-1" id="groups" role="group" aria-label="Group by">
+          <button type="button" data-group="process" class="group rounded px-3 py-1 text-sm">Processes</button>
+          <button type="button" data-group="application" class="group rounded px-3 py-1 text-sm">Applications</button>
+        </div>
+      </div>
+      <div id="rankings" class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3"></div>
+      <p id="rankings-note" class="mt-2 text-xs text-slate-500"></p>
+    </section>
+
     <section class="grid grid-cols-1 gap-4 lg:grid-cols-2">
       <div class="rounded-lg bg-white p-4 shadow">
         <h2 class="mb-2 font-medium">Top consumers right now</h2>

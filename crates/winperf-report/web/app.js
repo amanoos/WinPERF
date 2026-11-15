@@ -20,6 +20,12 @@
     if (saved && (saved in RANGES || saved === 'custom')) rangeKey = saved;
   } catch (_) { /* storage may be blocked; the default is fine */ }
   let custom = null; // { from, to } in ms while the custom range is shown
+  let groupKey = 'process';
+  try {
+    const saved = localStorage.getItem('winperf.group');
+    if (saved === 'process' || saved === 'application') groupKey = saved;
+  } catch (_) { /* optional */ }
+  let intervalSecs = 5;
   if (rangeKey === 'custom') rangeKey = '1h';
 
   // ---- formatting ----------------------------------------------------------------------------
@@ -139,6 +145,7 @@
     pill.textContent = (s.recording ? 'Recording' : 'Not recording') + ' · last sample ' + age;
     pill.className = 'rounded-full px-3 py-1 text-xs font-medium ' +
       (s.recording ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white');
+    if (s.interval_secs) intervalSecs = s.interval_secs;
     $('now-anomalies').textContent = String(s.active_anomalies);
     $('anomaly-card').className = 'rounded-lg p-4 shadow ' + (s.active_anomalies > 0 ? 'bg-amber-100' : 'bg-white');
   }
@@ -191,6 +198,101 @@
     $('anomalies-empty').classList.toggle('hidden', list.anomalies.length > 0);
   }
 
+  // ---- rankings ------------------------------------------------------------------------------
+
+  const METRICS = [
+    { key: 'cpu', title: 'CPU', fmt: pct, hint: 'Share of the whole machine\'s CPU' },
+    { key: 'memory', title: 'Memory', fmt: bytes, hint: 'Working set; memory shared between processes counts in each' },
+    { key: 'disk_read', title: 'Disk read', fmt: rate, hint: 'All I/O the process reads (files, pipes, devices), not only the physical disk' },
+    { key: 'disk_write', title: 'Disk write', fmt: rate, hint: 'All I/O the process writes, not only the physical disk' },
+    { key: 'net_rx', title: 'Network received', fmt: rate, hint: 'Per-process network traffic (needs the monitor to run as administrator)' },
+    { key: 'net_tx', title: 'Network sent', fmt: rate, hint: 'Per-process network traffic (needs the monitor to run as administrator)' },
+  ];
+  let rankingsRun = 0;
+  let rankingsAt = 0;
+
+  function rankingCard(metric, data) {
+    const card = el('div', 'rounded-lg bg-white p-4 shadow');
+    const title = el('h3', 'mb-2 font-medium', metric.title);
+    title.title = metric.hint;
+    card.append(title);
+    if (!data) {
+      card.append(el('p', 'text-sm text-slate-500', 'Could not load.'));
+      return card;
+    }
+    if (!data.available) {
+      card.append(el('p', 'text-sm text-slate-500', 'Not measured in this range. ' + (data.note || '')));
+      return card;
+    }
+    if (data.rows.length === 0) {
+      card.append(el('p', 'text-sm text-slate-500', 'Nothing recorded in this range.'));
+      return card;
+    }
+    const table = el('table', 'w-full text-left text-sm');
+    const head = el('tr', 'text-slate-500');
+    head.append(el('th', 'py-1 pr-2', groupKey === 'process' ? 'Process' : 'Application'),
+      el('th', 'py-1 pr-2 text-right', 'Now'), el('th', 'py-1 pr-2 text-right', 'Average'), el('th', 'py-1 text-right', 'Peak'));
+    const thead = el('thead');
+    thead.append(head);
+    const tbody = el('tbody');
+    for (const r of data.rows) {
+      const row = el('tr', 'border-t border-slate-100');
+      const name = el('td', 'max-w-40 truncate py-1 pr-2', r.name);
+      name.title = r.application && r.application !== r.name ? r.name + ' · ' + r.application : r.name;
+      row.append(name,
+        el('td', 'py-1 pr-2 text-right tabular-nums', r.current === null ? 'not running' : metric.fmt(r.current)),
+        el('td', 'py-1 pr-2 text-right tabular-nums', metric.fmt(r.average)),
+        el('td', 'py-1 text-right tabular-nums', metric.fmt(r.peak)));
+      tbody.append(row);
+    }
+    table.append(thead, tbody);
+    const wrap = el('div', 'overflow-x-auto');
+    wrap.append(table);
+    card.append(wrap);
+    return card;
+  }
+
+  async function loadRankings(from, to) {
+    const run = ++rankingsRun;
+    rankingsAt = Date.now();
+    const base = '/api/rankings?group=' + groupKey + '&limit=8&from_ms=' + Math.floor(from) + '&to_ms=' + Math.ceil(to) + '&metric=';
+    const results = await Promise.allSettled(METRICS.map((m) => api(base + m.key)));
+    if (run !== rankingsRun) return; // a newer request replaced this one
+    const box = $('rankings');
+    box.replaceChildren();
+    let sampled = 1;
+    results.forEach((r, i) => {
+      const data = r.status === 'fulfilled' ? r.value : null;
+      if (data && data.sampled_every_ticks > sampled) sampled = data.sampled_every_ticks;
+      box.append(rankingCard(METRICS[i], data));
+    });
+    $('rankings-note').textContent =
+      'Average is over the whole range, counting the time something was not running as zero, so a short burst ranks below steady work. ' +
+      'Processes with several copies running are added together. ' +
+      (sampled > 1
+        ? 'This range is long, so it is read from about every ' + sampled + 'th sample (roughly every ' +
+          ago(sampled * intervalSecs * 1000) + '); peaks are the highest of those moments.'
+        : '');
+  }
+
+  const GON = 'group rounded px-3 py-1 text-sm bg-slate-800 text-white';
+  const GOFF = 'group rounded px-3 py-1 text-sm bg-slate-200 text-slate-700 hover:bg-slate-300';
+  function markGroup() {
+    document.querySelectorAll('button.group').forEach((b) => {
+      b.className = b.dataset.group === groupKey ? GON : GOFF;
+      b.setAttribute('aria-pressed', String(b.dataset.group === groupKey));
+    });
+  }
+  $('groups').addEventListener('click', (event) => {
+    const key = event.target.dataset && event.target.dataset.group;
+    if (!key || key === groupKey) return;
+    groupKey = key;
+    try { localStorage.setItem('winperf.group', key); } catch (_) { /* optional */ }
+    markGroup();
+    const { from, to } = window_();
+    loadRankings(from, to);
+  });
+
   // ---- loading -------------------------------------------------------------------------------
 
   function window_() {
@@ -200,10 +302,11 @@
   }
 
   let busy = false;
-  async function refresh() {
+  async function refresh(force) {
     if (busy) return;
     busy = true;
     const { from, to } = window_();
+    if (force || Date.now() - rankingsAt > 30000) loadRankings(from, to);
     try {
       const results = await Promise.allSettled([
         api('/api/status'),
@@ -257,7 +360,7 @@
       try { localStorage.setItem('winperf.range', key); } catch (_) { /* optional */ }
     }
     markRange();
-    refresh();
+    refresh(true);
   });
 
   $('custom').addEventListener('submit', (event) => {
@@ -271,7 +374,7 @@
     error.textContent = '';
     custom = { from, to };
     markRange();
-    refresh();
+    refresh(true);
   });
 
   // ---- polling -------------------------------------------------------------------------------
@@ -280,5 +383,6 @@
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 
   markRange();
-  refresh();
+  markGroup();
+  refresh(true);
 })();

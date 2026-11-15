@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use winperf_core::anomaly::AnomalyKind;
 use winperf_core::time::unix_millis_now;
-use winperf_storage::{AnomalyFilter, Database, StoredAnomaly, StoredSystemSample};
+use winperf_storage::{
+    AnomalyFilter, Database, RankGroup, RankMetric, StoredAnomaly, StoredSystemSample,
+};
 
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -292,6 +294,89 @@ pub async fn system(State(shared): State<Shared>, Query(q): Query<SystemQuery>) 
             "samples": samples.len(),
             "bucket_ms": bucket_ms,
             "points": rows,
+        }))
+    })
+    .await?;
+    Ok(Json(body))
+}
+
+// ---- /api/rankings --------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RankingQuery {
+    /// cpu, memory, disk_read, disk_write, net_rx or net_tx.
+    metric: Option<String>,
+    /// `process` (one executable) or `application` (an installed product).
+    group: Option<String>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    limit: Option<u32>,
+}
+
+fn unit_of(metric: RankMetric) -> &'static str {
+    match metric {
+        RankMetric::Cpu => "percent",
+        RankMetric::Memory => "bytes",
+        _ => "bytes_per_sec",
+    }
+}
+
+pub async fn rankings(State(shared): State<Shared>, Query(q): Query<RankingQuery>) -> ApiResult {
+    let metric = match q.metric.as_deref() {
+        None => RankMetric::Cpu,
+        Some(m) => RankMetric::parse(m).ok_or_else(|| {
+            bad("metric must be one of cpu, memory, disk_read, disk_write, net_rx, net_tx")
+        })?,
+    };
+    let group = match q.group.as_deref() {
+        None => RankGroup::Process,
+        Some(g) => {
+            RankGroup::parse(g).ok_or_else(|| bad("group must be process or application"))?
+        }
+    };
+    let to_ms = q.to_ms.unwrap_or_else(unix_millis_now);
+    let from_ms = q.from_ms.unwrap_or(to_ms - HOUR_MS);
+    if from_ms >= to_ms {
+        return Err(bad("from_ms must be before to_ms"));
+    }
+    if to_ms - from_ms > MAX_RANGE_MS {
+        return Err(bad("the range may be at most 400 days"));
+    }
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    let body = with_db(&shared, move |db| {
+        let ranking = db
+            .rankings(metric, group, from_ms, to_ms, limit)
+            .map_err(read_err)?;
+        let note = if ranking.available {
+            None
+        } else {
+            Some(match metric {
+                RankMetric::NetRx | RankMetric::NetTx => {
+                    "per-process network use was not measured in this period (it needs the monitor to run with administrator rights, which the service does)"
+                }
+                _ => "this was not measured in this period",
+            })
+        };
+        Ok(json!({
+            "metric": metric.as_str(),
+            "group": match group {
+                RankGroup::Process => "process",
+                RankGroup::Application => "application",
+            },
+            "unit": unit_of(metric),
+            "from_ms": from_ms,
+            "to_ms": to_ms,
+            "ticks": ranking.ticks,
+            "sampled_every_ticks": ranking.sampled_every,
+            "available": ranking.available,
+            "note": note,
+            "rows": ranking.rows.iter().map(|r| json!({
+                "name": r.name,
+                "application": r.application,
+                "current": r.current,
+                "average": r.average,
+                "peak": r.peak,
+            })).collect::<Vec<_>>(),
         }))
     })
     .await?;

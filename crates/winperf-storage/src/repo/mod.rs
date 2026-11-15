@@ -5,10 +5,12 @@ pub mod baselines;
 pub mod inventory;
 pub mod lifecycle;
 pub mod profile;
+pub mod rankings;
 pub mod samples;
 
 pub use anomalies::{AnomalyFilter, StoredAnomaly};
 pub use baselines::{ListedBaseline, RecomputeReport, StoredBaseline};
 pub use inventory::{ExecutableRow, FileIdentity};
 pub use profile::ProfileState;
+pub use rankings::{RankGroup, RankMetric, RankRow, Ranking};
 pub use samples::{CurrentProcess, SampleHealth, StoredSample, StoredSystemSample};
