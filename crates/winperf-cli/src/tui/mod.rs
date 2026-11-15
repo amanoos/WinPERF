@@ -5,6 +5,7 @@
 //! does not write the database (the monitor or service is the single writer).
 
 pub mod app;
+pub mod baselines;
 pub mod ui;
 
 use app::App;
@@ -164,6 +165,9 @@ fn event_loop(
             apply(app, msg);
             dirty = true;
         }
+        if app.refresh_baselines_if_due() {
+            dirty = true;
+        }
     }
     Ok(())
 }
@@ -198,6 +202,7 @@ pub fn snapshot(
     while let Ok(msg) = feed.rx.try_recv() {
         apply(&mut app, msg);
     }
+    app.refresh_baselines_if_due();
     // The in-memory backend cannot fail (its error type is `Infallible`).
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
     terminal

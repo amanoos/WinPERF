@@ -1,7 +1,7 @@
 //! Drawing the dashboard. Pure rendering of [`App`]: no I/O, so it is tested with ratatui's
 //! `TestBackend`. Laid out for an 80x24 terminal and grows gracefully beyond it.
 
-use super::app::{App, ProcessRow, SortColumn};
+use super::app::{App, ProcessRow, SortColumn, View};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -89,6 +89,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: true }), area);
         return;
     }
+    if app.view == View::Baselines {
+        super::baselines::draw(f, area, &mut app.baselines);
+        return;
+    }
     let [title, system, table, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(8),
@@ -110,6 +114,7 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
             "System overview - sampling every {}s",
             app.interval.as_secs()
         )),
+        Span::styled("   b: baselines", Style::new().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(title), area);
 }

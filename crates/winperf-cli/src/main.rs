@@ -68,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         action: BaselineAction,
     },
+    /// Baseline collection mode: start or stop learning, and see how far it has got
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
     /// Show or create the configuration file
     Config {
         #[command(subcommand)]
@@ -89,6 +94,9 @@ enum Command {
         /// Don't capture the mouse (keeps the terminal's own text selection working)
         #[arg(long)]
         no_mouse: bool,
+        /// Open on the Baseline Explorer instead of the process table (press b to switch)
+        #[arg(long)]
+        baselines: bool,
         /// Instead of the interactive screen, sample twice and print one frame as text
         #[arg(long)]
         snapshot: bool,
@@ -111,6 +119,16 @@ enum BaselineAction {
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         window: Option<u32>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// Enter profiling mode (baselines are being learned; detection holds back)
+    Start,
+    /// Leave profiling mode
+    Stop,
+    /// Show the mode, whether a monitor is running, and baseline confidence so far
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -326,7 +344,35 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 BaselineAction::List { window } => {
                     let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
                     let window = window.unwrap_or_else(|| windows.first().copied().unwrap_or(1));
-                    commands::baseline::list(&db, window, &mut out).map_err(io)
+                    commands::baseline::list(&db, window, &config.baseline.confidence, &mut out)
+                        .map_err(io)
+                }
+            }
+        }
+        Command::Profile { action } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let now = unix_millis_now();
+            let mut out = std::io::stdout().lock();
+            let longest = config.baseline.windows_hours.last().copied().unwrap_or(24);
+            match action {
+                ProfileAction::Start => {
+                    let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+                    commands::profile::start(&db, now, &mut out).map_err(|e| e.to_string())
+                }
+                ProfileAction::Stop => {
+                    let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+                    commands::profile::stop(&db, now, &mut out).map_err(|e| e.to_string())
+                }
+                ProfileAction::Status => {
+                    let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+                    commands::profile::status(
+                        &db,
+                        longest,
+                        &config.baseline.confidence,
+                        now,
+                        &mut out,
+                    )
+                    .map_err(|e| e.to_string())
                 }
             }
         }
@@ -364,10 +410,16 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             interval,
             no_network,
             no_mouse,
+            baselines,
             snapshot,
             width,
             height,
         } => {
+            let source = tui::baselines::BaselineSource {
+                db_path: resolve_db_path(cli.db.clone(), config.storage.database.as_deref()),
+                windows: config.baseline.windows_hours.clone(),
+                confidence: config.baseline.confidence.clone(),
+            };
             let want_network = config.monitor.network && !no_network;
             let interval = Duration::from_secs(interval);
             // Built on the engine thread (performance-counter handles aren't `Send`).
@@ -387,7 +439,8 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 (metrics, status)
             };
             let feed = tui::Feed::spawn(make, interval);
-            let app = tui::app::App::new(interval, NetworkStatus::RequiresAdmin);
+            let app = tui::app::App::new(interval, NetworkStatus::RequiresAdmin)
+                .with_baselines(source, baselines);
             if snapshot {
                 let text = tui::snapshot(&feed, app, 2, width, height).map_err(io)?;
                 print!("{text}");

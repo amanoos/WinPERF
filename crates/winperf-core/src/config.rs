@@ -94,6 +94,34 @@ pub struct BaselineConfig {
     pub windows_hours: Vec<u32>,
     /// How often a running monitor recomputes the baselines, in minutes.
     pub recompute_minutes: u32,
+    pub confidence: ConfidenceConfig,
+}
+
+/// How much history a baseline needs before it is trusted. A level is reached when *both* its
+/// observation count and its observation span are met; levels must strictly increase.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfidenceConfig {
+    pub preliminary_observations: u64,
+    pub preliminary_minutes: u64,
+    pub established_observations: u64,
+    pub established_minutes: u64,
+    pub high_observations: u64,
+    pub high_minutes: u64,
+}
+
+impl Default for ConfidenceConfig {
+    fn default() -> Self {
+        // At the default 5 s interval: 5 minutes, 2 hours and 1 day of continuous sampling.
+        Self {
+            preliminary_observations: 60,
+            preliminary_minutes: 5,
+            established_observations: 1_000,
+            established_minutes: 120,
+            high_observations: 10_000,
+            high_minutes: 1_440,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -135,6 +163,7 @@ impl Default for BaselineConfig {
         Self {
             windows_hours: vec![1, 24, 168],
             recompute_minutes: 15,
+            confidence: ConfidenceConfig::default(),
         }
     }
 }
@@ -203,6 +232,17 @@ sensitivity = "normal"
 windows_hours = [1, 24, 168]
 # How often a running `monitor run` recomputes the baselines, in minutes (1 to 1440).
 recompute_minutes = 15
+
+[baseline.confidence]
+# A baseline reaches a level when it has at least this many observations spread over at least
+# this many minutes. Below the first level it is "Insufficient" and anomalies are not raised.
+# Levels must strictly increase. Defaults assume the 5 s interval.
+preliminary_observations = 60
+preliminary_minutes = 5
+established_observations = 1000
+established_minutes = 120
+high_observations = 10000
+high_minutes = 1440
 "#;
 
 impl Config {
@@ -258,6 +298,36 @@ impl Config {
                 "baseline.recompute_minutes must be between 1 and 1440 (got {})",
                 self.baseline.recompute_minutes
             ));
+        }
+        let c = &self.baseline.confidence;
+        let levels = [
+            (
+                "preliminary",
+                c.preliminary_observations,
+                c.preliminary_minutes,
+            ),
+            (
+                "established",
+                c.established_observations,
+                c.established_minutes,
+            ),
+            ("high", c.high_observations, c.high_minutes),
+        ];
+        for (name, observations, minutes) in levels {
+            if observations == 0 || minutes == 0 {
+                problems.push(format!(
+                    "baseline.confidence.{name}_observations and {name}_minutes must be at least 1"
+                ));
+            }
+        }
+        if levels
+            .windows(2)
+            .any(|w| w[0].1 >= w[1].1 || w[0].2 >= w[1].2)
+        {
+            problems.push(
+                "baseline.confidence levels must strictly increase (preliminary < established < high) in both observations and minutes"
+                    .into(),
+            );
         }
         if let Some(db) = &self.storage.database
             && db.as_os_str().is_empty()
@@ -461,6 +531,24 @@ mod tests {
             );
         }
         assert!(Config::from_toml_str("[baseline]\nwindows_hours = [1]\n").is_ok());
+    }
+
+    #[test]
+    fn confidence_levels_must_be_positive_and_strictly_increasing() {
+        for bad in [
+            "preliminary_observations = 0",
+            "preliminary_minutes = 0",
+            "established_observations = 60", // equal to preliminary
+            "established_minutes = 5",
+            "high_observations = 500", // below established
+            "high_minutes = 100",
+        ] {
+            let text = format!("[baseline.confidence]\n{bad}\n");
+            assert!(Config::from_toml_str(&text).is_err(), "{bad}");
+        }
+        let ok = "[baseline.confidence]\npreliminary_observations = 10\nestablished_observations = 20\n\
+                  high_observations = 30\n";
+        assert!(Config::from_toml_str(ok).is_ok());
     }
 
     #[test]

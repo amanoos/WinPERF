@@ -31,6 +31,27 @@ pub fn filetime_to_utc_string(ft: u64) -> Option<String> {
     ))
 }
 
+/// Unix milliseconds -> `YYYY-MM-DD HH:MM:SS` in UTC. `None` for negative values.
+pub fn unix_millis_to_utc_string(ms: i64) -> Option<String> {
+    let secs = u64::try_from(ms).ok()? / 1000;
+    filetime_to_utc_string((secs + FILETIME_TO_UNIX_SECS) * TICKS_PER_SEC)
+}
+
+/// A span as a short human string: `42s`, `5m 03s`, `2h 05m`, `3d 04h`. Negative spans read `0s`.
+pub fn format_span(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    let (d, h, m, sec) = (s / 86_400, s % 86_400 / 3600, s % 3600 / 60, s % 60);
+    if d > 0 {
+        format!("{d}d {h:02}h")
+    } else if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {sec:02}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
 /// Current time as Unix milliseconds (UTC).
 pub fn unix_millis_now() -> i64 {
     std::time::SystemTime::now()
@@ -58,6 +79,28 @@ mod tests {
         assert!(s.starts_with("20"), "{s}");
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], " ");
+    }
+
+    #[test]
+    fn unix_millis_convert_to_utc_text() {
+        assert_eq!(
+            unix_millis_to_utc_string(1_709_214_307_999).as_deref(),
+            Some("2024-02-29 13:45:07")
+        );
+        assert_eq!(
+            unix_millis_to_utc_string(0).as_deref(),
+            Some("1970-01-01 00:00:00")
+        );
+        assert_eq!(unix_millis_to_utc_string(-1), None);
+    }
+
+    #[test]
+    fn spans_read_naturally() {
+        assert_eq!(format_span(-5), "0s");
+        assert_eq!(format_span(42_000), "42s");
+        assert_eq!(format_span(303_000), "5m 03s");
+        assert_eq!(format_span(7_500_000), "2h 05m");
+        assert_eq!(format_span(3 * 86_400_000 + 4 * 3_600_000), "3d 04h");
     }
 
     #[test]

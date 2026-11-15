@@ -1,6 +1,7 @@
 //! TUI state and behaviour, independent of drawing and of the terminal: feed it engine batches
 //! and key presses, read back what to show. Everything here is unit-tested without a terminal.
 
+use crate::tui::baselines::{BaselineSource, BaselineView, Nav};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -13,6 +14,13 @@ use winperf_core::network::NetworkStatus;
 use winperf_core::sampling::Sample;
 use winperf_core::system::SystemSample;
 use winperf_core::{Metric, ProcessKey};
+
+/// Which screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Processes,
+    Baselines,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
@@ -136,6 +144,8 @@ pub struct App {
     /// header's screen row. Filled in by the renderer, used to turn mouse clicks into sorting.
     pub header_hits: Vec<(SortColumn, u16, u16)>,
     pub header_y: u16,
+    pub view: View,
+    pub baselines: BaselineView,
 }
 
 impl App {
@@ -154,7 +164,24 @@ impl App {
             should_quit: false,
             header_hits: Vec::new(),
             header_y: 0,
+            view: View::Processes,
+            baselines: BaselineView::new(None),
         }
+    }
+
+    /// Give the Baseline Explorer a database to read, optionally opening on it.
+    pub fn with_baselines(mut self, source: BaselineSource, open: bool) -> Self {
+        self.baselines = BaselineView::new(Some(source));
+        if open {
+            self.view = View::Baselines;
+        }
+        self
+    }
+
+    /// Re-read the stored baselines if the explorer is showing and its data is old or was
+    /// asked to reload. Returns whether the screen changed.
+    pub fn refresh_baselines_if_due(&mut self) -> bool {
+        self.view == View::Baselines && self.baselines.refresh_if_due()
     }
 
     /// Fold one engine tick into the view.
@@ -268,6 +295,14 @@ impl App {
     /// Mouse: click a column header to sort by it (click again to flip), click a row to select it,
     /// wheel to scroll the selection.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.view == View::Baselines {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.baselines.scroll(-3),
+                MouseEventKind::ScrollDown => self.baselines.scroll(3),
+                _ => {}
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if mouse.row == self.header_y {
@@ -298,8 +333,20 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if self.view == View::Baselines {
+            match self.baselines.on_key(key) {
+                Nav::Back => self.view = View::Processes,
+                Nav::Quit => self.should_quit = true,
+                Nav::Stay => {}
+            }
+            return;
+        }
         let page = self.page_size.max(1) as isize;
         match (key.code, key.modifiers) {
+            (KeyCode::Char('b'), _) => {
+                self.view = View::Baselines;
+                self.baselines.mark_stale();
+            }
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => self.should_quit = true,
             (KeyCode::Char('q') | KeyCode::Esc, _) => self.should_quit = true,
             (KeyCode::Up | KeyCode::Char('k'), _) => self.move_selection(-1),
@@ -567,6 +614,42 @@ pub(crate) mod tests {
         a.on_key(key(KeyCode::End));
         a.sync_table();
         assert_eq!(a.table.selected(), None);
+    }
+
+    #[test]
+    fn b_opens_the_baseline_explorer_and_b_or_esc_returns_without_quitting() {
+        let mut a = app();
+        a.on_key(ch('b'));
+        assert_eq!(a.view, View::Baselines);
+        // Keys now belong to the explorer: 'c' no longer sorts the process table.
+        a.on_key(ch('m'));
+        assert_eq!(a.sort, SortColumn::Cpu);
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.view, View::Processes);
+        assert!(!a.should_quit, "Esc leaves the explorer, it does not quit");
+        a.on_key(ch('b'));
+        a.on_key(ch('b'));
+        assert_eq!(a.view, View::Processes);
+        a.on_key(ch('b'));
+        a.on_key(ch('q'));
+        assert!(a.should_quit, "q still quits from the explorer");
+    }
+
+    #[test]
+    fn the_explorer_only_loads_while_it_is_showing() {
+        let mut a = app();
+        assert!(!a.refresh_baselines_if_due(), "process view: nothing to do");
+        let source = BaselineSource {
+            db_path: std::env::temp_dir().join("winperf-app-nonexistent.db"),
+            windows: vec![24],
+            confidence: Default::default(),
+        };
+        let mut a = app().with_baselines(source, true);
+        assert_eq!(a.view, View::Baselines);
+        assert!(a.refresh_baselines_if_due(), "first draw loads");
+        assert!(!a.refresh_baselines_if_due(), "and then waits");
+        a.on_key(ch('r'));
+        assert!(a.refresh_baselines_if_due(), "r asks for a reload");
     }
 
     #[test]
