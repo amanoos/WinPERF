@@ -96,7 +96,40 @@
     return out;
   }
 
+  // A line may carry `band`: the stored baseline row { median, p95 } of the same metric. It is
+  // drawn as two dashed lines with the stretch between them shaded; the numbers are the stored
+  // ones, unchanged.
+  function bandMarks(band, format, labelled) {
+    if (!band) return {};
+    // The two labels sit on opposite sides of their lines, so they stay readable when the typical
+    // level and the 95th percentile are close together.
+    const label = (position) => labelled
+      ? { show: true, position, fontSize: 11, formatter: (p) => p.name + ' ' + format(p.value) }
+      : { show: false };
+    return {
+      markLine: {
+        silent: true,
+        symbol: 'none',
+        lineStyle: { type: 'dashed', width: 1 },
+        data: [
+          { name: 'typical', yAxis: band.median, label: label('insideEndBottom') },
+          { name: 'p95', yAxis: band.p95, label: label('insideEndTop') },
+        ],
+      },
+      markArea: { silent: true, itemStyle: { opacity: 0.08 }, data: [[{ yAxis: band.median }, { yAxis: band.p95 }]] },
+    };
+  }
+
   function draw(id, from, to, lines, format, max) {
+    // With a baseline the axis must also reach the baseline's upper line.
+    if (max === undefined && lines.some((l) => l.band)) {
+      let top = 0;
+      for (const l of lines) {
+        for (const [, v] of l.data) if (num(v) && v > top) top = v;
+        if (l.band && l.band.p95 > top) top = l.band.p95;
+      }
+      if (top > 0) max = top * 1.1;
+    }
     chart(id).setOption({
       animation: false,
       grid: { left: 8, right: 16, top: lines.length > 1 ? 28 : 12, bottom: 4, containLabel: true },
@@ -107,11 +140,14 @@
       series: lines.map((l) => ({
         name: l.name,
         type: 'line',
-        showSymbol: false,
+        // Few points (a short-lived program): show them, or a single point would be invisible.
+        showSymbol: l.data.filter(([, v]) => v !== null).length < 60,
+        symbolSize: 5,
         connectNulls: false,
         lineStyle: { width: 1.5 },
         areaStyle: { opacity: 0.12 },
         data: l.data,
+        ...bandMarks(l.band, format, lines.length === 1),
       })),
     }, true);
   }
@@ -176,25 +212,27 @@
     $('top-empty').classList.toggle('hidden', current.processes.length > 0);
   }
 
+  function anomalyItem(a) {
+    const li = el('li', 'rounded border border-slate-200 p-2');
+    const head = el('div', 'flex flex-wrap items-center gap-2');
+    head.append(
+      el('span', 'rounded px-2 py-0.5 text-xs font-semibold uppercase ' +
+        (SEVERITY[a.severity] || SEVERITY.informational), a.severity),
+      el('span', 'font-medium', a.kind === 'memory_growth' ? 'memory growth' : a.resource),
+      el('span', '', a.process.name),
+      el('span', 'text-xs text-slate-500',
+        (a.state === 'active' ? 'active since ' : 'resolved · ') + when(a.detected_ts_ms)),
+    );
+    const more = el('details', 'mt-1 text-sm text-slate-700');
+    more.append(el('summary', 'cursor-pointer text-slate-500', 'Why was this flagged?'), el('p', 'mt-1', a.explanation));
+    li.append(head, more);
+    return li;
+  }
+
   function showAnomalies(list) {
     const ul = $('anomalies');
     ul.replaceChildren();
-    for (const a of list.anomalies.slice(0, 20)) {
-      const li = el('li', 'rounded border border-slate-200 p-2');
-      const head = el('div', 'flex flex-wrap items-center gap-2');
-      head.append(
-        el('span', 'rounded px-2 py-0.5 text-xs font-semibold uppercase ' +
-          (SEVERITY[a.severity] || SEVERITY.informational), a.severity),
-        el('span', 'font-medium', a.kind === 'memory_growth' ? 'memory growth' : a.resource),
-        el('span', '', a.process.name),
-        el('span', 'text-xs text-slate-500',
-          (a.state === 'active' ? 'active since ' : 'resolved · ') + when(a.detected_ts_ms)),
-      );
-      const more = el('details', 'mt-1 text-sm text-slate-700');
-      more.append(el('summary', 'cursor-pointer text-slate-500', 'Why was this flagged?'), el('p', 'mt-1', a.explanation));
-      li.append(head, more);
-      ul.append(li);
-    }
+    for (const a of list.anomalies.slice(0, 20)) ul.append(anomalyItem(a));
     $('anomalies-empty').classList.toggle('hidden', list.anomalies.length > 0);
   }
 
@@ -237,8 +275,15 @@
     const tbody = el('tbody');
     for (const r of data.rows) {
       const row = el('tr', 'border-t border-slate-100');
-      const name = el('td', 'max-w-40 truncate py-1 pr-2', r.name);
+      const name = el('td', 'max-w-40 truncate py-1 pr-2');
       name.title = r.application && r.application !== r.name ? r.name + ' · ' + r.application : r.name;
+      if (r.subject) {
+        const link = el('a', 'text-sky-700 hover:underline', r.name);
+        link.href = '#/subject/' + r.subject.scope + '/' + r.subject.id;
+        name.append(link);
+      } else {
+        name.textContent = r.name;
+      }
       row.append(name,
         el('td', 'py-1 pr-2 text-right tabular-nums', r.current === null ? 'not running' : metric.fmt(r.current)),
         el('td', 'py-1 pr-2 text-right tabular-nums', metric.fmt(r.average)),
@@ -292,6 +337,211 @@
     const { from, to } = window_();
     loadRankings(from, to);
   });
+
+  // ---- detail page ---------------------------------------------------------------------------
+
+  let view = 'dashboard';
+  let detailKey = null; // 'application/12' or 'executable/3'
+  let detailRun = 0;
+  let detailWindow = null; // the baseline window (hours) the person picked, if any
+  let detailData = null;
+
+  function showDetailError(text) {
+    const n = $('detail-error');
+    n.textContent = text || '';
+    n.classList.toggle('hidden', !text);
+  }
+
+  const SIGNATURE = {
+    valid: 'signed',
+    not_signed: 'not signed',
+    invalid: 'signature invalid',
+    unreadable: 'signature could not be read',
+  };
+  const signature = (status, signer) =>
+    (SIGNATURE[status] || status) + (signer && status === 'valid' ? ' by ' + signer : '');
+
+  function metaRow(label, value) {
+    if (value === null || value === undefined || value === '') return [];
+    const dt = el('dt', 'text-slate-500', label);
+    const dd = el('dd', 'break-words');
+    if (value instanceof Node) dd.append(value); else dd.textContent = String(value);
+    return [dt, dd];
+  }
+
+  function subjectLink(scope, id, text) {
+    const a = el('a', 'text-sky-700 hover:underline', text);
+    a.href = '#/subject/' + scope + '/' + id;
+    return a;
+  }
+
+  function showMeta(d) {
+    $('d-name').textContent = d.name;
+    document.title = d.name + ' \u00b7 WinPerf report';
+    $('d-kind').textContent =
+      (d.scope === 'application' ? 'Installed application' : 'Program file') + ' \u00b7 ' + d.classification.replace(/_/g, ' ');
+    const dl = $('d-meta');
+    dl.replaceChildren();
+    const rows = [
+      metaRow('Publisher', d.publisher),
+      metaRow('Version', d.version),
+      metaRow('Description', d.description),
+      metaRow(d.scope === 'application' ? 'Installed in' : 'File', d.location),
+      metaRow('Signature', d.signature ? signature(d.signature.status, d.signature.signer) : null),
+      metaRow('Installed on', d.install_date),
+      metaRow('Part of', d.application ? subjectLink('application', d.application.id, d.application.name) : null),
+      metaRow('First seen by a scan', d.first_seen),
+      metaRow('Last seen by a scan', d.last_seen),
+    ];
+    for (const pair of rows) dl.append(...pair);
+  }
+
+  function showExecutables(d) {
+    const body = $('d-exes');
+    body.replaceChildren();
+    for (const e of d.executables) {
+      const row = el('tr', 'border-t border-slate-100');
+      const name = el('td', 'py-1 pr-3');
+      name.append(d.scope === 'application' ? subjectLink('executable', e.id, e.file_name) : document.createTextNode(e.file_name));
+      const path = el('td', 'break-all py-1 text-slate-600', e.file_path);
+      row.append(name, el('td', 'py-1 pr-3', signature(e.signature_status, e.signer)),
+        el('td', 'py-1 pr-3 text-right tabular-nums', String(e.running)),
+        el('td', 'py-1 pr-3 text-right tabular-nums', String(e.instances)), path);
+      body.append(row);
+    }
+    $('d-exes-empty').classList.toggle('hidden', d.executables.length > 0);
+  }
+
+  function showRuns(d) {
+    const body = $('d-runs');
+    body.replaceChildren();
+    for (const r of d.runs) {
+      const row = el('tr', 'border-t border-slate-100');
+      const name = el('td', 'py-1 pr-3', r.name);
+      if (r.exe_path) name.title = r.exe_path;
+      row.append(name, el('td', 'py-1 pr-3 text-right tabular-nums', String(r.pid)),
+        el('td', 'py-1 pr-3', r.first_seen), el('td', 'py-1 pr-3', r.last_seen),
+        el('td', 'py-1 pr-3', r.ended || 'not marked as ended'), el('td', 'py-1', r.user || ''));
+      body.append(row);
+    }
+    $('d-runs-empty').classList.toggle('hidden', d.runs.length > 0);
+  }
+
+  // The stored baseline rows of one window, by metric.
+  function baselinesOf(d, windowHours) {
+    const out = {};
+    for (const b of d.baselines) if (b.window_hours === windowHours) out[b.metric] = b;
+    return out;
+  }
+
+  function drawDetailCharts(d, from, to, windowHours) {
+    const pts = d.series;
+    const k = d.bucket_ms;
+    const bl = baselinesOf(d, windowHours);
+    draw('d-chart-cpu', from, to, [{ name: 'CPU', data: seriesOf(pts, 'cpu_percent', k), band: bl.cpu }], pct);
+    draw('d-chart-mem', from, to, [{ name: 'Memory', data: seriesOf(pts, 'working_set_bytes', k), band: bl.memory }], bytes);
+    draw('d-chart-disk', from, to, [
+      { name: 'Read', data: seriesOf(pts, 'disk_read_bytes_per_sec', k), band: bl.disk_read },
+      { name: 'Write', data: seriesOf(pts, 'disk_write_bytes_per_sec', k), band: bl.disk_write },
+    ], rate);
+    draw('d-chart-net', from, to, [
+      { name: 'Received', data: seriesOf(pts, 'net_rx_bytes_per_sec', k), band: bl.net_rx },
+      { name: 'Sent', data: seriesOf(pts, 'net_tx_bytes_per_sec', k), band: bl.net_tx },
+    ], rate);
+    const any = d.baselines.find((b) => b.window_hours === windowHours);
+    $('d-baseline-note').textContent = any
+      ? 'Dashed lines are the stored baseline for the last ' + windowHours + ' h: the typical level (median) and the 95th percentile, ' +
+        'with the stretch between them shaded. It was computed ' + when(any.computed_at_ms) + ' from ' + any.observations +
+        ' samples. Values are totals over all running copies, averaged within each point; gaps mean it was not running or not recorded.'
+      : 'No baseline has been stored for this yet; it needs the monitor to have recorded it for a while.';
+    if (d.sampled_every_ticks > 1) {
+      $('d-baseline-note').textContent += ' This range is long, so the history is read from about every ' + d.sampled_every_ticks +
+        'th sample (roughly every ' + ago(d.sampled_every_ticks * intervalSecs * 1000) + '); a program that ran for less than that can be missing.';
+    }
+  }
+
+  function renderDetail(d, from, to) {
+    detailData = d;
+    showMeta(d);
+    showExecutables(d);
+    showRuns(d);
+    const list = $('d-anomalies');
+    list.replaceChildren();
+    for (const a of d.anomalies) list.append(anomalyItem(a));
+    $('d-anomalies-empty').classList.toggle('hidden', d.anomalies.length > 0);
+
+    const windows = [...new Set(d.baselines.map((b) => b.window_hours))].sort((a, b) => a - b);
+    if (!windows.includes(detailWindow)) detailWindow = windows.length ? windows[windows.length - 1] : null;
+    const select = $('d-window');
+    select.replaceChildren();
+    for (const w of windows) {
+      const o = el('option', '', w + ' h');
+      o.value = String(w);
+      select.append(o);
+    }
+    select.value = String(detailWindow);
+    select.disabled = windows.length === 0;
+    drawDetailCharts(d, from, to, detailWindow);
+  }
+
+  $('d-window').addEventListener('change', (event) => {
+    detailWindow = Number(event.target.value);
+    if (detailData) {
+      const { from, to } = window_();
+      drawDetailCharts(detailData, from, to, detailWindow);
+    }
+  });
+
+  async function loadDetail() {
+    if (!detailKey) return;
+    const run = ++detailRun;
+    const { from, to } = window_();
+    try {
+      const [d, status] = await Promise.all([
+        api('/api/subjects/' + detailKey + '?points=300&from_ms=' + Math.floor(from) + '&to_ms=' + Math.ceil(to)),
+        api('/api/status').catch(() => null), // only for the recording pill in the header
+      ]);
+      if (run !== detailRun || view !== 'detail') return;
+      showDetailError('');
+      if (status) showStatus(status);
+      renderDetail(d, from, to);
+      $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      if (run === detailRun) {
+        showDetailError(e.message);
+        if (!detailData) $('d-name').textContent = 'Not available';
+      }
+    }
+  }
+
+  // ---- views ---------------------------------------------------------------------------------
+
+  function route() {
+    const m = /^#\/subject\/(application|executable)\/(\d+)$/.exec(location.hash);
+    const next = m ? 'detail' : 'dashboard';
+    const changed = next !== view || (m && detailKey !== m[1] + '/' + m[2]);
+    view = next;
+    $('view-dashboard').classList.toggle('hidden', view !== 'dashboard');
+    $('view-detail').classList.toggle('hidden', view !== 'detail');
+    if (!changed) return;
+    if (view === 'detail') {
+      detailKey = m[1] + '/' + m[2];
+      detailData = null;
+      for (const id of ['d-meta', 'd-exes', 'd-runs', 'd-anomalies']) $(id).replaceChildren(); // the last page's
+      $('d-kind').textContent = '';
+      $('d-name').textContent = 'Loading\u2026';
+      showDetailError('');
+      window.scrollTo(0, 0);
+      loadDetail();
+    } else {
+      document.title = 'WinPerf report';
+      detailKey = null;
+      refresh(true);
+    }
+    // Charts were laid out while their page was hidden; let them measure themselves again.
+    Object.values(charts).forEach((c) => c.resize());
+  }
+  window.addEventListener('hashchange', route);
 
   // ---- loading -------------------------------------------------------------------------------
 
@@ -360,7 +610,7 @@
       try { localStorage.setItem('winperf.range', key); } catch (_) { /* optional */ }
     }
     markRange();
-    refresh(true);
+    reload(true);
   });
 
   $('custom').addEventListener('submit', (event) => {
@@ -374,15 +624,20 @@
     error.textContent = '';
     custom = { from, to };
     markRange();
-    refresh(true);
+    reload(true);
   });
 
   // ---- polling -------------------------------------------------------------------------------
 
-  setInterval(() => { if (!document.hidden && !custom) refresh(); }, POLL_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  function reload(force) {
+    return view === 'detail' ? loadDetail() : refresh(force);
+  }
+
+  setInterval(() => { if (!document.hidden && !custom) reload(); }, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) reload(); });
 
   markRange();
   markGroup();
-  refresh(true);
+  route();
+  if (view === 'dashboard') refresh(true);
 })();

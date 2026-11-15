@@ -96,6 +96,7 @@ pub fn app(settings: ReportSettings) -> Router {
         .route("/api/current", get(api::current))
         .route("/api/system", get(api::system))
         .route("/api/rankings", get(api::rankings))
+        .route("/api/subjects/{scope}/{id}", get(api::subject))
         .route("/api/anomalies", get(api::anomalies))
         .route("/api/anomalies/{id}", get(api::anomaly))
         .layer(axum::middleware::from_fn_with_state(

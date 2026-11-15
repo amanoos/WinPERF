@@ -5,7 +5,7 @@ use crate::error::{Result, StorageError};
 use rusqlite::{OptionalExtension, params};
 use winperf_core::anomaly::{AnomalyEvent, AnomalyKind, BaselineSet, BaselineStats, Severity};
 use winperf_core::config::{ConfidenceConfig, Resource};
-use winperf_core::profiler::baseline::BaselineMetric;
+use winperf_core::profiler::baseline::{BaselineMetric, Scope};
 use winperf_core::profiler::confidence::assess;
 
 /// One stored anomaly event, as read back.
@@ -234,6 +234,38 @@ impl Database {
         Ok(out)
     }
 
+    /// Events about one subject (an executable, or an installed application and all its
+    /// executables) that were active at or after `since_ms`, active ones first then newest first.
+    /// A process counts when its instance is linked to the subject, or its path is one of the
+    /// subject's executables.
+    pub fn subject_anomalies(
+        &self,
+        scope: Scope,
+        subject_id: i64,
+        since_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<StoredAnomaly>> {
+        let (instances, paths) = match scope {
+            Scope::Executable => (
+                "SELECT id FROM process_instances WHERE executable_id = ?2",
+                "SELECT path_key FROM executables WHERE id = ?2",
+            ),
+            Scope::Application => (
+                "SELECT id FROM process_instances WHERE application_id = ?2",
+                "SELECT e.path_key FROM executables e WHERE e.id IN                  (SELECT executable_id FROM process_instances WHERE application_id = ?2)",
+            ),
+        };
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT {COLUMNS} FROM anomaly_events              WHERE (resolved_ts_ms IS NULL OR resolved_ts_ms >= ?1)                AND (process_instance_id IN ({instances}) OR LOWER(exe_path) IN ({paths}))              ORDER BY resolved_ts_ms IS NULL DESC, detected_ts_ms DESC, id DESC LIMIT ?3"
+        ))?;
+        let mut rows = stmt.query(params![since_ms, subject_id, limit])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(from_row(r)?);
+        }
+        Ok(out)
+    }
+
     pub fn anomaly(&self, id: i64) -> Result<Option<StoredAnomaly>> {
         let mut stmt = self.conn().prepare(&format!(
             "SELECT {COLUMNS} FROM anomaly_events WHERE id = ?1"
@@ -409,6 +441,56 @@ mod tests {
         let back = db.anomaly(id).unwrap().unwrap();
         assert_eq!(back.process_instance_id, Some(9));
         assert_eq!(back.application.as_deref(), Some("Busy Suite"));
+    }
+
+    #[test]
+    fn a_subjects_events_are_found_by_instance_link_or_by_path() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO installed_applications (id, app_key, name, registry_sources, \
+                   classification, first_seen, last_seen, scan_seq) \
+                 VALUES (1, 'busy|1|x', 'Busy Suite', 'hklm', 'third_party', 't', 't', 1); \
+                 INSERT INTO executables (id, path_key, file_path, file_name, signature_status, \
+                   classification, file_size, file_mtime_ns, verified_at) \
+                 VALUES (5, 'c:\\apps\\busy.exe', 'C:\\apps\\Busy.exe', 'busy.exe', 'valid', \
+                   'third_party', 1, 1, 't'), \
+                        (6, 'c:\\apps\\other.exe', 'C:\\apps\\other.exe', 'other.exe', 'valid', \
+                   'third_party', 1, 1, 't'); \
+                 INSERT INTO process_instances (id, pid, start_time, parent_pid, name, \
+                   executable_id, application_id, first_seen, last_seen) \
+                 VALUES (9, 7, 100, 0, 'busy.exe', 5, 1, 't', 't');",
+            )
+            .unwrap();
+        // Linked by instance (pid 7); the second has no instance but the same executable path;
+        // the third is someone else.
+        db.insert_anomaly(&event(1_000, 7, Severity::Warning))
+            .unwrap();
+        db.insert_anomaly(&event(2_000, 8, Severity::High)).unwrap();
+        let mut other = event(3_000, 9, Severity::Warning);
+        other.exe_path = r"C:\apps\other.exe".into();
+        db.insert_anomaly(&other).unwrap();
+
+        let pids = |rows: Vec<StoredAnomaly>| rows.iter().map(|r| r.pid).collect::<Vec<_>>();
+        assert_eq!(
+            pids(db.subject_anomalies(Scope::Executable, 5, 0, 10).unwrap()),
+            [8, 7]
+        );
+        assert_eq!(
+            pids(db.subject_anomalies(Scope::Application, 1, 0, 10).unwrap()),
+            [8, 7],
+            "an application's events include its executables'"
+        );
+        assert_eq!(
+            pids(db.subject_anomalies(Scope::Executable, 6, 0, 10).unwrap()),
+            [9]
+        );
+        assert!(
+            db.subject_anomalies(Scope::Executable, 5, 0, 1)
+                .unwrap()
+                .len()
+                == 1
+        );
     }
 
     // ---- lifecycle -----------------------------------------------------------------------

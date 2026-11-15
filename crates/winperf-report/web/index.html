@@ -30,7 +30,7 @@
     </form>
   </header>
 
-  <main class="mx-auto max-w-7xl space-y-4 p-4">
+  <main id="view-dashboard" class="mx-auto max-w-7xl space-y-4 p-4">
     <p id="notice" class="hidden rounded-lg bg-amber-100 p-3 text-sm text-amber-900"></p>
 
     <section class="grid grid-cols-2 gap-3 md:grid-cols-5" aria-label="Health now">
@@ -77,9 +77,64 @@
         <p id="anomalies-empty" class="hidden text-sm text-slate-500">No anomalies in the last 24 hours.</p>
       </div>
     </section>
-
-    <footer class="pb-4 text-xs text-slate-500"><span id="updated">Not updated yet</span> · all data comes from this machine; the page makes no outside requests.</footer>
   </main>
+
+  <main id="view-detail" class="mx-auto hidden max-w-7xl space-y-4 p-4">
+    <a href="#/" class="inline-block text-sm text-sky-700 hover:underline">← Back to the dashboard</a>
+    <p id="detail-error" class="hidden rounded-lg bg-amber-100 p-3 text-sm text-amber-900"></p>
+
+    <section class="rounded-lg bg-white p-4 shadow" aria-label="About">
+      <h2 id="d-name" class="text-xl font-semibold">Loading…</h2>
+      <p id="d-kind" class="text-sm text-slate-500"></p>
+      <dl id="d-meta" class="mt-3 grid grid-cols-1 gap-x-6 gap-y-1 text-sm sm:grid-cols-2"></dl>
+    </section>
+
+    <section class="rounded-lg bg-white p-4 shadow" aria-label="Processes">
+      <h2 class="mb-2 font-medium">Processes</h2>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead class="text-slate-500"><tr><th class="py-1 pr-3">Executable</th><th class="py-1 pr-3">Signature</th><th class="py-1 pr-3 text-right">Running at last record</th><th class="py-1 pr-3 text-right">Recorded</th><th class="py-1">Path</th></tr></thead>
+          <tbody id="d-exes"></tbody>
+        </table>
+      </div>
+      <p id="d-exes-empty" class="hidden text-sm text-slate-500">No process of this has been recorded.</p>
+    </section>
+
+    <section aria-label="History against the baseline">
+      <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-lg font-semibold">History against its baseline</h2>
+        <label class="flex items-center gap-2 text-sm">Baseline window
+          <select id="d-window" class="rounded bg-white px-2 py-1 text-slate-900 shadow"></select>
+        </label>
+      </div>
+      <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">CPU</h3><div id="d-chart-cpu" class="h-56 w-full"></div></div>
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">Memory (working set)</h3><div id="d-chart-mem" class="h-56 w-full"></div></div>
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">Disk throughput</h3><div id="d-chart-disk" class="h-56 w-full"></div></div>
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">Network</h3><div id="d-chart-net" class="h-56 w-full"></div></div>
+      </div>
+      <p id="d-baseline-note" class="mt-2 text-xs text-slate-500"></p>
+    </section>
+
+    <section class="rounded-lg bg-white p-4 shadow" aria-label="Anomalies">
+      <h2 class="mb-2 font-medium">Anomalies <span class="text-sm font-normal text-slate-500">(in the selected range)</span></h2>
+      <ul id="d-anomalies" class="space-y-2"></ul>
+      <p id="d-anomalies-empty" class="hidden text-sm text-slate-500">No anomalies in this range.</p>
+    </section>
+
+    <section class="rounded-lg bg-white p-4 shadow" aria-label="Execution history">
+      <h2 class="mb-2 font-medium">Execution history <span class="text-sm font-normal text-slate-500">(most recent 50 runs; times are UTC)</span></h2>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead class="text-slate-500"><tr><th class="py-1 pr-3">Process</th><th class="py-1 pr-3 text-right">PID</th><th class="py-1 pr-3">First seen</th><th class="py-1 pr-3">Last seen</th><th class="py-1 pr-3">Ended</th><th class="py-1">User</th></tr></thead>
+          <tbody id="d-runs"></tbody>
+        </table>
+      </div>
+      <p id="d-runs-empty" class="hidden text-sm text-slate-500">No runs recorded.</p>
+    </section>
+  </main>
+
+  <footer class="mx-auto max-w-7xl px-4 pb-4 text-xs text-slate-500"><span id="updated">Not updated yet</span> · all data comes from this machine; the page makes no outside requests.</footer>
 
   <script src="/echarts.min.js"></script>
   <script src="/app.js"></script>

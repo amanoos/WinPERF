@@ -9,9 +9,11 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use winperf_core::anomaly::AnomalyKind;
+use winperf_core::profiler::baseline::Scope;
 use winperf_core::time::unix_millis_now;
 use winperf_storage::{
-    AnomalyFilter, Database, RankGroup, RankMetric, StoredAnomaly, StoredSystemSample,
+    AnomalyFilter, Database, RankGroup, RankMetric, StoredAnomaly, StoredBaseline,
+    StoredSystemSample,
 };
 
 const HOUR_MS: i64 = 3_600_000;
@@ -373,6 +375,7 @@ pub async fn rankings(State(shared): State<Shared>, Query(q): Query<RankingQuery
             "rows": ranking.rows.iter().map(|r| json!({
                 "name": r.name,
                 "application": r.application,
+                "subject": subject_link(group, r.executable_id, r.application_id),
                 "current": r.current,
                 "average": r.average,
                 "peak": r.peak,
@@ -381,6 +384,139 @@ pub async fn rankings(State(shared): State<Shared>, Query(q): Query<RankingQuery
     })
     .await?;
     Ok(Json(body))
+}
+
+/// The detail page a ranking row links to: an application row goes to its application (or, with
+/// none, to its executable); a process row to its executable.
+fn subject_link(group: RankGroup, exe: Option<i64>, app: Option<i64>) -> Value {
+    match (group, exe, app) {
+        (RankGroup::Application, _, Some(id)) => json!({ "scope": "application", "id": id }),
+        (_, Some(id), _) => json!({ "scope": "executable", "id": id }),
+        _ => Value::Null,
+    }
+}
+
+// ---- /api/subjects/{scope}/{id} -------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct SubjectQuery {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    points: Option<u32>,
+}
+
+fn baseline_json(b: &StoredBaseline) -> Value {
+    json!({
+        "window_hours": b.window_hours,
+        "metric": b.metric.as_str(),
+        "observations": b.observations,
+        "first_ts_ms": b.first_ts_ms,
+        "last_ts_ms": b.last_ts_ms,
+        "mean": b.mean,
+        "median": b.median,
+        "mad": b.mad,
+        "stddev": b.stddev,
+        "p95": b.p95,
+        "peak": b.peak,
+        "growth_per_hour": b.growth_per_hour,
+        "computed_at_ms": b.computed_at_ms,
+    })
+}
+
+/// Everything the detail page of one application or executable shows, in one answer. The baselines
+/// are the stored rows, unchanged: nothing is recomputed here.
+pub async fn subject(
+    State(shared): State<Shared>,
+    Path((scope, id)): Path<(String, i64)>,
+    Query(q): Query<SubjectQuery>,
+) -> ApiResult {
+    let scope =
+        Scope::parse(&scope).ok_or_else(|| bad("scope must be application or executable"))?;
+    let to_ms = q.to_ms.unwrap_or_else(unix_millis_now);
+    let from_ms = q.from_ms.unwrap_or(to_ms - DAY_MS);
+    if from_ms >= to_ms {
+        return Err(bad("from_ms must be before to_ms"));
+    }
+    if to_ms - from_ms > MAX_RANGE_MS {
+        return Err(bad("the range may be at most 400 days"));
+    }
+    let points = q.points.unwrap_or(300).clamp(10, 1000);
+    let bucket_ms = ((to_ms - from_ms) / i64::from(points) + 1).max(1);
+    let found = with_db(&shared, move |db| {
+        let Some(info) = db.subject_info(scope, id).map_err(read_err)? else {
+            return Ok(None);
+        };
+        let executables = db.subject_executables(scope, id).map_err(read_err)?;
+        let series = db
+            .subject_series(scope, id, from_ms, to_ms, bucket_ms)
+            .map_err(read_err)?;
+        let baselines = db.baselines_for(scope, id).map_err(read_err)?;
+        let anomalies = db
+            .subject_anomalies(scope, id, from_ms, 100)
+            .map_err(read_err)?;
+        let runs = db.subject_runs(scope, id, 50).map_err(read_err)?;
+        Ok(Some(json!({
+            "scope": scope.as_str(),
+            "id": id,
+            "name": info.name,
+            "publisher": info.publisher,
+            "version": info.version,
+            "location": info.location,
+            "description": info.description,
+            "classification": info.classification,
+            "signature": info.signature_status.as_ref().map(|status| json!({
+                "status": status,
+                "signer": info.signer,
+            })),
+            "install_date": info.install_date,
+            "first_seen": info.first_seen,
+            "last_seen": info.last_seen,
+            "application": info.application.as_ref().map(|(id, name)| json!({ "id": id, "name": name })),
+            "executables": executables.iter().map(|e| json!({
+                "id": e.id,
+                "file_name": e.file_name,
+                "file_path": e.file_path,
+                "signature_status": e.signature_status,
+                "signer": e.signer,
+                "classification": e.classification,
+                "instances": e.instances,
+                "running": e.open_instances,
+            })).collect::<Vec<_>>(),
+            "from_ms": from_ms,
+            "to_ms": to_ms,
+            "bucket_ms": bucket_ms,
+            "ticks": series.ticks,
+            "sampled_every_ticks": series.sampled_every,
+            "series": series.points.iter().map(|p| json!({
+                "ts_ms": p.ts_ms,
+                "cpu_percent": p.cpu,
+                "working_set_bytes": p.memory,
+                "disk_read_bytes_per_sec": p.disk_read,
+                "disk_write_bytes_per_sec": p.disk_write,
+                "net_rx_bytes_per_sec": p.net_rx,
+                "net_tx_bytes_per_sec": p.net_tx,
+            })).collect::<Vec<_>>(),
+            "baselines": baselines.iter().map(baseline_json).collect::<Vec<_>>(),
+            "anomalies": anomalies.iter().map(anomaly_json).collect::<Vec<_>>(),
+            "runs": runs.iter().map(|r| json!({
+                "pid": r.pid,
+                "name": r.name,
+                "exe_path": r.exe_path,
+                "user": r.user_account,
+                "first_seen": r.first_seen,
+                "last_seen": r.last_seen,
+                "ended": r.end_time,
+            })).collect::<Vec<_>>(),
+        })))
+    })
+    .await?;
+    match found {
+        Some(body) => Ok(Json(body)),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("there is no {} {id}", scope.as_str()),
+        )),
+    }
 }
 
 // ---- /api/anomalies -------------------------------------------------------------------------

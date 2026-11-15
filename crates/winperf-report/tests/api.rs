@@ -369,3 +369,154 @@ async fn rankings_average_over_the_period_and_flag_what_was_not_measured() {
         assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
     }
 }
+
+/// Application 1 ("Suite", by Acme) owns suite.exe (executable 5, instance 11, signed) and has
+/// run for 10 minutes with a stored 1 h baseline; one anomaly belongs to it, one to someone else.
+fn seed_subject(path: &Path) -> i64 {
+    use winperf_core::profiler::baseline::Scope;
+    let mut db = Database::open(path).unwrap();
+    let now = unix_millis_now();
+    db.conn()
+        .execute_batch(
+            "INSERT INTO installed_applications (id, app_key, name, publisher, version, \
+               install_location, registry_sources, classification, first_seen, last_seen, scan_seq) \
+             VALUES (1, 'suite|2|acme', 'Suite', 'Acme', '2.0', 'C:/Suite', 'x', 'third_party', 'a', 'b', 1); \
+             INSERT INTO executables (id, path_key, file_path, file_name, signature_status, signer, \
+               classification, file_size, file_mtime_ns, verified_at) \
+             VALUES (5, 'c:/apps/busy.exe', 'C:/apps/busy.exe', 'busy.exe', 'valid', 'Acme', \
+               'third_party', 1, 1, 't'); \
+             INSERT INTO process_instances (id, pid, start_time, parent_pid, name, executable_id, \
+               application_id, first_seen, last_seen) VALUES (11, 11, 100, 0, 'busy.exe', 5, 1, 'f', 'l'); \
+             INSERT INTO process_instances (id, pid, start_time, parent_pid, name, first_seen, last_seen) \
+               VALUES (12, 12, 100, 0, 'stranger.exe', 'f', 'l');",
+        )
+        .unwrap();
+    for i in 0..120 {
+        let ts = now - i * 5_000;
+        let cpu = 10.0 + (i % 7) as f64;
+        db.conn()
+            .execute(
+                &format!("INSERT INTO system_samples (ts_ms) VALUES ({ts})"),
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO resource_samples (process_instance_id, ts_ms, cpu_percent, \
+                     working_set_bytes) VALUES (11, {ts}, {cpu}, 2097152)"
+                ),
+                [],
+            )
+            .unwrap();
+    }
+    db.recompute_baselines(now, 1).unwrap();
+    assert!(
+        !db.baselines_for(Scope::Application, 1).unwrap().is_empty(),
+        "the seed must give the application a baseline"
+    );
+    db.insert_anomaly(&event(now - 60_000, 11, Severity::High))
+        .unwrap();
+    let mut stranger = event(now - 30_000, 12, Severity::Warning);
+    stranger.process_name = "stranger.exe".into();
+    stranger.exe_path = r"C:\elsewhere\stranger.exe".into();
+    db.insert_anomaly(&stranger).unwrap();
+    now
+}
+
+#[tokio::test]
+async fn a_subject_page_carries_its_metadata_history_stored_baselines_and_events() {
+    use winperf_core::profiler::baseline::Scope;
+    let s = Scratch::new();
+    let now = seed_subject(&s.db());
+    let app = app(settings(s.db(), None));
+    let range = format!("from_ms={}&to_ms={}&points=20", now - 700_000, now + 1);
+
+    let (code, page) = local(&app, &format!("/api/subjects/application/1?{range}")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(page["name"], "Suite");
+    assert_eq!(page["publisher"], "Acme");
+    assert_eq!(page["version"], "2.0");
+    assert_eq!(page["location"], "C:/Suite");
+    let exes = page["executables"].as_array().unwrap();
+    assert_eq!(exes.len(), 1);
+    assert_eq!(exes[0]["file_name"], "busy.exe");
+    assert_eq!(exes[0]["signature_status"], "valid");
+    assert_eq!(exes[0]["running"], 1);
+
+    // History: bucketed, newest included, values are the summed instance (one here).
+    let series = page["series"].as_array().unwrap();
+    assert!(!series.is_empty() && series.len() <= 21, "{}", series.len());
+    assert_eq!(page["ticks"], 120);
+    assert_eq!(
+        page["sampled_every_ticks"], 1,
+        "a short range reads every tick"
+    );
+    assert_eq!(series[0]["working_set_bytes"], 2_097_152.0);
+    assert!(series[0]["net_rx_bytes_per_sec"].is_null());
+
+    // The baseline rows are exactly what the database holds, nothing recomputed.
+    let stored = Database::open_read_only(&s.db())
+        .unwrap()
+        .baselines_for(Scope::Application, 1)
+        .unwrap();
+    let shown = page["baselines"].as_array().unwrap();
+    assert_eq!(shown.len(), stored.len());
+    for (row, db_row) in shown.iter().zip(&stored) {
+        assert_eq!(row["metric"], db_row.metric.as_str());
+        assert_eq!(row["window_hours"], db_row.window_hours);
+        assert_eq!(row["median"], db_row.median);
+        assert_eq!(row["mean"], db_row.mean);
+        assert_eq!(row["p95"], db_row.p95);
+        assert_eq!(row["peak"], db_row.peak);
+        assert_eq!(row["mad"], db_row.mad);
+        assert_eq!(row["observations"], db_row.observations);
+    }
+
+    // Only this application's event; the stranger's is left out.
+    let events = page["anomalies"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["process"]["name"], "busy.exe");
+    assert_eq!(page["runs"].as_array().unwrap().len(), 1);
+
+    // The executable has its own page, and knows its application.
+    let (_, exe) = local(&app, &format!("/api/subjects/executable/5?{range}")).await;
+    assert_eq!(exe["name"], "busy.exe");
+    assert_eq!(exe["signature"]["signer"], "Acme");
+    assert_eq!(exe["application"]["name"], "Suite");
+}
+
+#[tokio::test]
+async fn an_unknown_subject_or_scope_is_refused_clearly() {
+    let s = Scratch::new();
+    seed_subject(&s.db());
+    let app = app(settings(s.db(), None));
+    let (code, body) = local(&app, "/api/subjects/application/99").await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("99"));
+    for bad in [
+        "/api/subjects/team/1",
+        "/api/subjects/application/1?from_ms=9&to_ms=9",
+    ] {
+        let (code, _) = local(&app, bad).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn ranking_rows_say_which_detail_page_they_open() {
+    let s = Scratch::new();
+    let now = seed_subject(&s.db());
+    let app = app(settings(s.db(), None));
+    let range = format!("from_ms={}&to_ms={}", now - 700_000, now + 1);
+    let (_, by_process) = local(&app, &format!("/api/rankings?metric=memory&{range}")).await;
+    assert_eq!(by_process["rows"][0]["subject"]["scope"], "executable");
+    assert_eq!(by_process["rows"][0]["subject"]["id"], 5);
+    let (_, by_app) = local(
+        &app,
+        &format!("/api/rankings?metric=memory&group=application&{range}"),
+    )
+    .await;
+    assert_eq!(by_app["rows"][0]["subject"]["scope"], "application");
+    assert_eq!(by_app["rows"][0]["subject"]["id"], 1);
+}

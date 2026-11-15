@@ -100,6 +100,10 @@ pub struct RankRow {
     pub name: String,
     /// The installed application the executable belongs to, when known (process rows).
     pub application: Option<String>,
+    /// The executable and installed application behind the row, for linking to its detail page
+    /// (a process row spans every instance of one path, so this is that path's executable).
+    pub executable_id: Option<i64>,
+    pub application_id: Option<i64>,
     pub current: Option<f64>,
     pub average: f64,
     pub peak: f64,
@@ -118,7 +122,49 @@ pub struct Ranking {
     pub rows: Vec<RankRow>,
 }
 
+/// The ticks of a period that a query reads: all of them, or an even subset when there are many.
+pub(crate) struct TickPick {
+    /// Newest first; the newest tick of the period is always among them.
+    pub picked: Vec<i64>,
+    /// The same ticks as a JSON array, for `json_each(?)` in SQL.
+    pub list: String,
+    /// Ticks in the period, and how many of them one picked tick stands for (1 = all read).
+    pub total: i64,
+    pub stride: i64,
+}
+
 impl Database {
+    /// The ticks of the period (one system sample each), thinned to at most `max` evenly spaced
+    /// ones with the newest always among them: reading every sample of a long period takes many
+    /// seconds, while an even subset gives the same averages and is read in a fraction of the time.
+    /// (Peaks, and programs shorter than the gap between picked ticks, can be missed.)
+    pub(crate) fn pick_ticks(&self, from_ms: i64, to_ms: i64, max: usize) -> Result<TickPick> {
+        let all: Vec<i64> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT ts_ms FROM system_samples WHERE ts_ms BETWEEN ?1 AND ?2 ORDER BY ts_ms",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let stride = all.len().div_ceil(max).max(1);
+        // Newest first, so the newest tick is always picked.
+        let picked: Vec<i64> = all.iter().rev().step_by(stride).copied().collect();
+        let list = format!(
+            "[{}]",
+            picked
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Ok(TickPick {
+            picked,
+            list,
+            total: all.len() as i64,
+            stride: stride as i64,
+        })
+    }
+
     /// The `limit` biggest users of `metric` between `from_ms` and `to_ms`, biggest average first.
     pub fn rankings(
         &self,
@@ -129,30 +175,14 @@ impl Database {
         limit: u32,
     ) -> Result<Ranking> {
         let col = metric.column();
-        // The ticks of the period (one system sample each), thinned to at most MAX_TICKS evenly
-        // spaced ones with the newest always among them: reading every sample of a long period
-        // takes many seconds, while an even subset ranks the same and is read in a fraction of
-        // the time. (Peaks are then the highest of the sampled moments.)
-        let all: Vec<i64> = {
-            let mut stmt = self.conn().prepare(
-                "SELECT ts_ms FROM system_samples WHERE ts_ms BETWEEN ?1 AND ?2 ORDER BY ts_ms",
-            )?;
-            let rows = stmt.query_map(params![from_ms, to_ms], |r| r.get(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let stride = all.len().div_ceil(MAX_TICKS).max(1);
-        // Newest first, so the newest tick is always picked.
-        let picked: Vec<i64> = all.iter().rev().step_by(stride).copied().collect();
-        let ticks = (all.len() as i64).max(1);
-        let sampled_every = stride as i64;
-        let list = format!(
-            "[{}]",
-            picked
-                .iter()
-                .map(i64::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let TickPick {
+            picked,
+            list,
+            total,
+            stride,
+        } = self.pick_ticks(from_ms, to_ms, MAX_TICKS)?;
+        let ticks = total.max(1);
+        let sampled_every = stride;
         // Measured at any of the ticks that are read? (Cheap, and the same ticks the ranking uses.)
         let available: bool = self.conn().query_row(
             &format!(
@@ -174,13 +204,15 @@ impl Database {
         let sql = format!(
             "WITH per_tick AS ( \
                  SELECT {key} AS k, MAX({label}) AS label, MAX(ia.name) AS app, \
+                        MAX(pi.executable_id) AS exe_id, MAX(pi.application_id) AS app_id, \
                         rs.ts_ms AS ts, SUM(rs.{col}) AS v \
                  FROM resource_samples rs \
                  JOIN process_instances pi ON pi.id = rs.process_instance_id \
                  LEFT JOIN installed_applications ia ON ia.id = pi.application_id \
                  WHERE rs.ts_ms IN (SELECT value FROM json_each(?1)) AND rs.{col} IS NOT NULL \
                  GROUP BY k, rs.ts_ms) \
-             SELECT label, MAX(app), SUM(v), MAX(v), SUM(CASE WHEN ts = ?2 THEN v END) \
+             SELECT label, MAX(app), SUM(v), MAX(v), SUM(CASE WHEN ts = ?2 THEN v END), \
+                    MAX(exe_id), MAX(app_id) \
              FROM per_tick GROUP BY k ORDER BY SUM(v) DESC, label LIMIT ?3"
         );
         let used = picked.len() as f64;
@@ -193,6 +225,8 @@ impl Database {
                 average: total / used,
                 peak: r.get(3)?,
                 current: r.get(4)?,
+                executable_id: r.get(5)?,
+                application_id: r.get(6)?,
             })
         })?;
         Ok(Ranking {
@@ -234,6 +268,13 @@ mod tests {
                  VALUES ({id}, {pid}, 100, 0, '{name}', 'C:/apps/{name}', {app}, 't', 't')"
             ));
         }
+        // Only chrome.exe has an executable row (id 7), shared by its two instances.
+        sql(
+            "INSERT INTO executables (id, path_key, file_path, file_name, signature_status, \
+             classification, file_size, file_mtime_ns, verified_at) \
+             VALUES (7, 'c:/apps/chrome.exe', 'C:/apps/chrome.exe', 'chrome.exe', 'valid', 't', 1, 1, 't'); \
+             UPDATE process_instances SET executable_id = 7 WHERE id IN (1, 2)",
+        );
         // (instance, ts, cpu, working set)
         for (i, ts, cpu, mem) in [
             (1, 1000, 10.0, 100),
@@ -279,7 +320,12 @@ mod tests {
         assert_eq!(chrome.peak, 30.0);
         assert_eq!(chrome.current, Some(30.0));
         assert_eq!(chrome.application.as_deref(), Some("Chrome"));
+        assert_eq!(
+            (chrome.executable_id, chrome.application_id),
+            (Some(7), Some(1))
+        );
         let other = &r.rows[1];
+        assert_eq!((other.executable_id, other.application_id), (None, None));
         assert_eq!((other.average, other.peak), (12.5, 50.0));
         assert_eq!(other.current, None, "not running at the newest tick");
         assert_eq!(other.application, None);
@@ -302,6 +348,7 @@ mod tests {
         assert_eq!(chrome.average, 20.0);
         assert_eq!(chrome.peak, 35.0);
         assert_eq!(chrome.current, Some(35.0));
+        assert_eq!(chrome.application_id, Some(1));
     }
 
     #[test]
