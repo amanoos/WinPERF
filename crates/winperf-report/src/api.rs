@@ -12,7 +12,7 @@ use winperf_core::anomaly::AnomalyKind;
 use winperf_core::profiler::baseline::Scope;
 use winperf_core::time::unix_millis_now;
 use winperf_storage::{
-    AnomalyFilter, Database, RankGroup, RankMetric, StoredAnomaly, StoredBaseline,
+    AnomalyFilter, Database, RankGroup, RankMetric, StoredAnomaly, StoredBaseline, StoredSample,
     StoredSystemSample,
 };
 
@@ -593,10 +593,94 @@ pub async fn anomalies(State(shared): State<Shared>, Query(q): Query<AnomalyQuer
     Ok(Json(body))
 }
 
+/// How far before the event, and after it ended, the investigation charts reach.
+const CONTEXT_MARGIN_MS: i64 = 10 * 60_000;
+/// The longest stretch of an event the charts show (a longer one is cut; its start is kept).
+const CONTEXT_MAX_MS: i64 = 3 * HOUR_MS;
+
+/// Average a process's samples into at most `points` buckets over `[from_ms, to_ms]`.
+fn process_points(samples: &[StoredSample], from_ms: i64, to_ms: i64, points: i64) -> Vec<Value> {
+    let bucket_ms = ((to_ms - from_ms) / points.max(1) + 1).max(1);
+    let mut buckets: std::collections::BTreeMap<i64, [Mean; 5]> = Default::default();
+    for s in samples {
+        let b = buckets.entry((s.ts_ms - from_ms) / bucket_ms).or_default();
+        b[0].add(s.cpu_percent);
+        b[1].add(s.working_set_bytes.map(|v| v as f64));
+        b[2].add(s.io_read_bytes_per_sec);
+        b[3].add(s.io_write_bytes_per_sec);
+        // Network is read and write together only when either was measured.
+        b[4].add(match (s.net_rx_bytes_per_sec, s.net_tx_bytes_per_sec) {
+            (None, None) => None,
+            (rx, tx) => Some(rx.unwrap_or(0.0) + tx.unwrap_or(0.0)),
+        });
+    }
+    buckets
+        .into_iter()
+        .map(|(i, b)| {
+            json!({
+                "ts_ms": from_ms + i * bucket_ms,
+                "cpu_percent": b[0].value(),
+                "working_set_bytes": b[1].value(),
+                "io_read_bytes_per_sec": b[2].value(),
+                "io_write_bytes_per_sec": b[3].value(),
+                "net_bytes_per_sec": b[4].value(),
+            })
+        })
+        .collect()
+}
+
+/// One event with what was going on around it: the process's own usage and the whole machine's,
+/// so the page can set the actual use against the baseline and show any concurrent slowdown.
 pub async fn anomaly(State(shared): State<Shared>, Path(id): Path<i64>) -> ApiResult {
-    let found = with_db(&shared, move |db| db.anomaly(id).map_err(read_err)).await?;
+    let found = with_db(&shared, move |db| {
+        let Some(a) = db.anomaly(id).map_err(read_err)? else {
+            return Ok(None);
+        };
+        let ended = a.resolved_ts_ms.unwrap_or(a.last_update_ts_ms);
+        let from_ms = a.detected_ts_ms - CONTEXT_MARGIN_MS;
+        let to_ms = ended.min(a.detected_ts_ms + CONTEXT_MAX_MS) + CONTEXT_MARGIN_MS;
+        let system = db
+            .system_samples_between(from_ms, to_ms)
+            .map_err(read_err)?;
+        let (bucket_ms, system_points) = downsample(&system, from_ms, to_ms, 240);
+        let process = match a.process_instance_id {
+            Some(instance) => {
+                let samples = db
+                    .instance_samples_between(instance, from_ms, to_ms)
+                    .map_err(read_err)?;
+                Some(process_points(&samples, from_ms, to_ms, 240))
+            }
+            None => None,
+        };
+        // Where to read more about the program: its application, else its executable.
+        let linked: Option<(Option<i64>, Option<i64>)> = a.process_instance_id.and_then(|i| {
+            db.conn()
+                .query_row(
+                    "SELECT executable_id, application_id FROM process_instances WHERE id = ?1",
+                    [i],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+        });
+        let mut body = anomaly_json(&a);
+        body["subject"] = match linked {
+            Some((_, Some(app))) => json!({ "scope": "application", "id": app }),
+            Some((Some(exe), None)) => json!({ "scope": "executable", "id": exe }),
+            _ => Value::Null,
+        };
+        body["context"] = json!({
+            "from_ms": from_ms,
+            "to_ms": to_ms,
+            "bucket_ms": bucket_ms,
+            "cut": ended > a.detected_ts_ms + CONTEXT_MAX_MS,
+            "system": system_points,
+            "process": process,
+        });
+        Ok(Some(body))
+    })
+    .await?;
     match found {
-        Some(a) => Ok(Json(anomaly_json(&a))),
+        Some(body) => Ok(Json(body)),
         None => Err(ApiError(
             StatusCode::NOT_FOUND,
             format!("there is no anomaly {id}"),

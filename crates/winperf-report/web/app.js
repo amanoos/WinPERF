@@ -99,25 +99,28 @@
   // A line may carry `band`: the stored baseline row { median, p95 } of the same metric. It is
   // drawn as two dashed lines with the stretch between them shaded; the numbers are the stored
   // ones, unchanged.
-  function bandMarks(band, format, labelled) {
-    if (!band) return {};
+  // `band.p95` may be left out for a single reference level (an event's baseline). `span` is
+  // [from, to] in ms: the stretch of time to shade (when an event was active).
+  function bandMarks(band, format, labelled, span) {
     // The two labels sit on opposite sides of their lines, so they stay readable when the typical
     // level and the 95th percentile are close together.
     const label = (position) => labelled
       ? { show: true, position, fontSize: 11, formatter: (p) => p.name + ' ' + format(p.value) }
       : { show: false };
-    return {
-      markLine: {
-        silent: true,
-        symbol: 'none',
-        lineStyle: { type: 'dashed', width: 1 },
-        data: [
-          { name: 'typical', yAxis: band.median, label: label('insideEndBottom') },
-          { name: 'p95', yAxis: band.p95, label: label('insideEndTop') },
-        ],
-      },
-      markArea: { silent: true, itemStyle: { opacity: 0.08 }, data: [[{ yAxis: band.median }, { yAxis: band.p95 }]] },
-    };
+    const out = {};
+    const areas = [];
+    if (band) {
+      const two = band.p95 !== undefined;
+      const lines = [{ name: two ? 'typical' : 'baseline', yAxis: band.median, label: label('insideEndBottom') }];
+      if (two) {
+        lines.push({ name: 'p95', yAxis: band.p95, label: label('insideEndTop') });
+        areas.push([{ yAxis: band.median }, { yAxis: band.p95 }]);
+      }
+      out.markLine = { silent: true, symbol: 'none', lineStyle: { type: 'dashed', width: 1 }, data: lines };
+    }
+    if (span) areas.push([{ xAxis: span[0], itemStyle: { color: '#f59e0b', opacity: 0.18 } }, { xAxis: span[1] }]);
+    if (areas.length) out.markArea = { silent: true, itemStyle: { opacity: 0.08 }, data: areas };
+    return out;
   }
 
   function draw(id, from, to, lines, format, max) {
@@ -126,7 +129,7 @@
       let top = 0;
       for (const l of lines) {
         for (const [, v] of l.data) if (num(v) && v > top) top = v;
-        if (l.band && l.band.p95 > top) top = l.band.p95;
+        if (l.band) top = Math.max(top, l.band.median, l.band.p95 || 0);
       }
       if (top > 0) max = top * 1.1;
     }
@@ -147,7 +150,7 @@
         lineStyle: { width: 1.5 },
         areaStyle: { opacity: 0.12 },
         data: l.data,
-        ...bandMarks(l.band, format, lines.length === 1),
+        ...bandMarks(l.band, format, lines.length === 1, l.span),
       })),
     }, true);
   }
@@ -224,7 +227,11 @@
         (a.state === 'active' ? 'active since ' : 'resolved · ') + when(a.detected_ts_ms)),
     );
     const more = el('details', 'mt-1 text-sm text-slate-700');
-    more.append(el('summary', 'cursor-pointer text-slate-500', 'Why was this flagged?'), el('p', 'mt-1', a.explanation));
+    const open = el('a', 'text-sky-700 hover:underline', 'Investigate');
+    open.href = '#/anomalies/' + a.id;
+    const links = el('p', 'mt-1');
+    links.append(open);
+    more.append(el('summary', 'cursor-pointer text-slate-500', 'Why was this flagged?'), el('p', 'mt-1', a.explanation), links);
     li.append(head, more);
     return li;
   }
@@ -514,17 +521,217 @@
     }
   }
 
+  // ---- anomalies: list and investigation -----------------------------------------------------
+
+  let anomalyId = null;
+  let anomalyData = null;
+  let anomalyRun = 0;
+  let listRun = 0;
+  let listData = [];
+  const filters = { state: 'all', severity: 'all', resource: 'all', text: '' };
+
+  function showAnomalyError(text) {
+    const n = $('anomaly-error');
+    n.textContent = text || '';
+    n.classList.toggle('hidden', !text);
+  }
+
+  const RESOURCE_LABEL = { cpu: 'CPU', memory: 'Memory', disk: 'Disk', network: 'Network' };
+  const kindLabel = (a) => (a.kind === 'memory_growth' ? 'memory growth' : RESOURCE_LABEL[a.resource] || a.resource);
+  // The unit of an event's numbers follows its resource.
+  const valueFormat = (a) => (a.kind === 'memory_growth' ? (v) => (num(v) ? bytes(v) + '/h' : '–')
+    : a.resource === 'cpu' ? pct : a.resource === 'memory' ? bytes : rate);
+
+  function duration(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 90) return s + ' s';
+    if (s < 5400) return Math.round(s / 60) + ' min';
+    return (s / 3600).toFixed(1) + ' h';
+  }
+
+  function ratio(a) {
+    return a.baseline > 0 ? (a.current / a.baseline).toFixed(a.current / a.baseline < 10 ? 1 : 0) + '× baseline' : 'no usable baseline';
+  }
+
+  function matches(a) {
+    if (filters.state === 'active' && a.state !== 'active') return false;
+    if (filters.severity !== 'all' && a.severity !== filters.severity) return false;
+    if (filters.resource !== 'all' && a.resource !== filters.resource) return false;
+    const t = filters.text.trim().toLowerCase();
+    if (t && !((a.process.name || '') + ' ' + (a.process.application || '')).toLowerCase().includes(t)) return false;
+    return true;
+  }
+
+  function showAnomalyList() {
+    const body = $('al-rows');
+    body.replaceChildren();
+    const shown = listData.filter(matches);
+    for (const a of shown) {
+      const row = el('tr', 'border-t border-slate-100 hover:bg-slate-50');
+      const sev = el('td', 'py-1 pr-3');
+      sev.append(el('span', 'rounded px-2 py-0.5 text-xs font-semibold uppercase ' + (SEVERITY[a.severity] || SEVERITY.informational), a.severity));
+      const who = el('td', 'py-1 pr-3');
+      const link = el('a', 'text-sky-700 hover:underline', a.process.name);
+      link.href = '#/anomalies/' + a.id;
+      who.append(link);
+      if (a.process.application) who.append(el('span', 'ml-2 text-xs text-slate-500', a.process.application));
+      const f = valueFormat(a);
+      row.append(sev, el('td', 'py-1 pr-3', kindLabel(a)), who,
+        el('td', 'py-1 pr-3 text-right tabular-nums', f(a.current)),
+        el('td', 'py-1 pr-3 text-right tabular-nums', f(a.baseline)),
+        el('td', 'py-1 pr-3 text-right tabular-nums', ratio(a)),
+        el('td', 'py-1 pr-3', when(a.detected_ts_ms)),
+        el('td', 'py-1 pr-3 text-right tabular-nums', duration(a.duration_ms)),
+        el('td', 'py-1', a.state === 'active' ? 'active' : 'resolved'));
+      body.append(row);
+    }
+    $('al-count').textContent = shown.length + ' of ' + listData.length + ' events in this range';
+    $('al-empty').classList.toggle('hidden', shown.length > 0);
+  }
+
+  async function loadAnomalyList() {
+    const run = ++listRun;
+    const { from, to } = window_();
+    const hours = Math.max(1, Math.ceil((Date.now() - from) / HOUR));
+    try {
+      const [res, status] = await Promise.all([
+        api('/api/anomalies?limit=1000&hours=' + hours),
+        api('/api/status').catch(() => null),
+      ]);
+      if (run !== listRun || view !== 'anomalies') return;
+      $('al-error').classList.add('hidden');
+      if (status) showStatus(status);
+      listData = res.anomalies.filter((a) => a.detected_ts_ms <= to);
+      showAnomalyList();
+      $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      if (run !== listRun) return;
+      $('al-error').textContent = e.message;
+      $('al-error').classList.remove('hidden');
+    }
+  }
+
+  function bindFilter(id, key) {
+    $(id).addEventListener('input', (event) => {
+      filters[key] = event.target.value;
+      showAnomalyList();
+    });
+  }
+  bindFilter('f-state', 'state');
+  bindFilter('f-severity', 'severity');
+  bindFilter('f-resource', 'resource');
+  bindFilter('f-text', 'text');
+
+  function fact(label, value) {
+    return [el('dt', 'text-slate-500', label), el('dd', 'font-medium', value)];
+  }
+
+  function showAnomaly(a) {
+    anomalyData = a;
+    const f = valueFormat(a);
+    document.title = a.process.name + ' · anomaly · WinPerf report';
+    $('a-title').textContent = a.process.name;
+    $('a-state').textContent = (a.state === 'active' ? 'Active since ' : 'Resolved · started ') + when(a.detected_ts_ms) +
+      (a.resolved_ts_ms ? ', ended ' + when(a.resolved_ts_ms) : '');
+    const sev = $('a-severity');
+    sev.className = 'inline-block rounded px-2 py-0.5 text-xs font-semibold uppercase ' + (SEVERITY[a.severity] || SEVERITY.informational);
+    sev.textContent = a.severity;
+    const facts = $('a-facts');
+    facts.replaceChildren();
+    const rows = [
+      fact('Process', a.process.name + ' (PID ' + a.process.pid + ')'),
+      a.process.application ? fact('Application', a.process.application) : [],
+      fact(kindLabel(a) + (a.kind === 'memory_growth' ? ' rate' : ' consumption'), f(a.current)),
+      fact('Established baseline', f(a.baseline)),
+      fact('Deviation', ratio(a) + ' (' + (a.deviation_percent >= 0 ? '+' : '') + Math.round(a.deviation_percent) + ' %)'),
+      fact('Duration', duration(a.duration_ms)),
+      fact('Baseline confidence', a.baseline_confidence + ' (last ' + a.baseline_window_hours + ' h)'),
+      fact('System CPU at the time', pct(a.system.cpu_percent)),
+      fact('System memory at the time', pct(a.system.memory_percent)),
+      fact('System disk busy at the time', pct(a.system.disk_percent)),
+      fact('System pressure / this process’s share', pct(a.impact.pressure_percent) + ' / ' + pct(a.impact.share_percent)),
+    ];
+    for (const pair of rows) facts.append(...pair);
+    $('a-assessment').textContent = a.explanation;
+    const link = $('a-subject');
+    link.classList.toggle('hidden', !a.subject);
+    if (a.subject) link.href = '#/subject/' + a.subject.scope + '/' + a.subject.id;
+    drawAnomalyCharts(a);
+  }
+
+  function drawAnomalyCharts(a) {
+    const c = a.context;
+    const f = valueFormat(a);
+    const span = [a.detected_ts_ms, a.resolved_ts_ms || a.last_update_ts_ms];
+    const proc = c.process;
+    $('a-chart-note').textContent = proc === null
+      ? 'The process’s own samples are not linked to this event, so only the system is shown.'
+      : (c.cut ? 'Long event: the charts show its first 3 hours. ' : '') +
+        'The shaded stretch is when the event was active; the dashed line is the baseline it was judged against.';
+    $('a-chart-proc-box').classList.toggle('hidden', proc === null);
+    if (proc !== null) {
+      const band = { median: a.baseline };
+      const lines = a.resource === 'disk'
+        ? [{ name: 'Read', data: seriesOf(proc, 'io_read_bytes_per_sec', c.bucket_ms), band, span },
+          { name: 'Write', data: seriesOf(proc, 'io_write_bytes_per_sec', c.bucket_ms), span }]
+        : a.resource === 'network'
+          ? [{ name: 'Network', data: seriesOf(proc, 'net_bytes_per_sec', c.bucket_ms), band, span }]
+          : a.resource === 'memory' || a.kind === 'memory_growth'
+            ? [{ name: 'Working set', data: seriesOf(proc, 'working_set_bytes', c.bucket_ms), band: a.kind === 'memory_growth' ? undefined : band, span }]
+            : [{ name: 'CPU', data: seriesOf(proc, 'cpu_percent', c.bucket_ms), band, span }];
+      $('a-chart-proc-title').textContent = a.process.name + ' — ' + kindLabel(a);
+      draw('a-chart-proc', c.from_ms, c.to_ms, lines, a.kind === 'memory_growth' ? bytes : f);
+    }
+    draw('a-chart-cpu', c.from_ms, c.to_ms, [{ name: 'System CPU', data: seriesOf(c.system, 'cpu_percent', c.bucket_ms), span }], pct, 100);
+    draw('a-chart-mem', c.from_ms, c.to_ms, [{ name: 'System memory', data: seriesOf(c.system, 'memory_used_percent', c.bucket_ms), span }], pct, 100);
+    draw('a-chart-disk', c.from_ms, c.to_ms, [{ name: 'Disk busy', data: seriesOf(c.system, 'disk_busy_percent', c.bucket_ms), span }], pct, 100);
+  }
+
+  async function loadAnomaly() {
+    if (!anomalyId) return;
+    const run = ++anomalyRun;
+    try {
+      const [a, status] = await Promise.all([api('/api/anomalies/' + anomalyId), api('/api/status').catch(() => null)]);
+      if (run !== anomalyRun || view !== 'anomaly') return;
+      showAnomalyError('');
+      if (status) showStatus(status);
+      showAnomaly(a);
+      $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      if (run !== anomalyRun) return;
+      showAnomalyError(e.message);
+      if (!anomalyData) $('a-title').textContent = 'Not available';
+    }
+  }
+
   // ---- views ---------------------------------------------------------------------------------
 
   function route() {
     const m = /^#\/subject\/(application|executable)\/(\d+)$/.exec(location.hash);
-    const next = m ? 'detail' : 'dashboard';
-    const changed = next !== view || (m && detailKey !== m[1] + '/' + m[2]);
+    const list = location.hash === '#/anomalies';
+    const one = /^#\/anomalies\/(\d+)$/.exec(location.hash);
+    const next = m ? 'detail' : list ? 'anomalies' : one ? 'anomaly' : 'dashboard';
+    const changed = next !== view || (m && detailKey !== m[1] + '/' + m[2]) || (one && anomalyId !== one[1]);
     view = next;
-    $('view-dashboard').classList.toggle('hidden', view !== 'dashboard');
-    $('view-detail').classList.toggle('hidden', view !== 'detail');
+    for (const [name, id] of [['dashboard', 'view-dashboard'], ['detail', 'view-detail'],
+      ['anomalies', 'view-anomalies'], ['anomaly', 'view-anomaly']]) {
+      $(id).classList.toggle('hidden', view !== name);
+    }
     if (!changed) return;
-    if (view === 'detail') {
+    if (view === 'anomalies') {
+      document.title = 'Anomalies · WinPerf report';
+      window.scrollTo(0, 0);
+      loadAnomalyList();
+    } else if (view === 'anomaly') {
+      anomalyId = one[1];
+      anomalyData = null;
+      $('a-title').textContent = 'Loading…';
+      for (const id of ['a-facts', 'a-assessment']) $(id).replaceChildren();
+      $('a-assessment').textContent = '';
+      showAnomalyError('');
+      window.scrollTo(0, 0);
+      loadAnomaly();
+    } else if (view === 'detail') {
       detailKey = m[1] + '/' + m[2];
       detailData = null;
       for (const id of ['d-meta', 'd-exes', 'd-runs', 'd-anomalies']) $(id).replaceChildren(); // the last page's
@@ -630,7 +837,10 @@
   // ---- polling -------------------------------------------------------------------------------
 
   function reload(force) {
-    return view === 'detail' ? loadDetail() : refresh(force);
+    if (view === 'detail') return loadDetail();
+    if (view === 'anomalies') return loadAnomalyList();
+    if (view === 'anomaly') return loadAnomaly();
+    return refresh(force);
   }
 
   setInterval(() => { if (!document.hidden && !custom) reload(); }, POLL_MS);

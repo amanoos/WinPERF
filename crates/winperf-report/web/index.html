@@ -12,6 +12,7 @@
       <div class="flex items-center gap-3">
         <h1 class="text-lg font-semibold">WinPerf</h1>
         <span id="recording" class="rounded-full bg-slate-700 px-3 py-1 text-xs font-medium">checking…</span>
+        <nav class="flex gap-3 text-sm"><a href="#/" class="hover:underline">Dashboard</a><a href="#/anomalies" class="hover:underline">Anomalies</a></nav>
       </div>
       <div class="flex flex-wrap items-center gap-2" id="ranges" role="group" aria-label="Time range">
         <button type="button" data-range="15m" class="range rounded px-3 py-1 text-sm">15 min</button>
@@ -131,6 +132,52 @@
         </table>
       </div>
       <p id="d-runs-empty" class="hidden text-sm text-slate-500">No runs recorded.</p>
+    </section>
+  </main>
+
+  <main id="view-anomalies" class="mx-auto hidden max-w-7xl space-y-4 p-4">
+    <h2 class="text-lg font-semibold">Anomalies</h2>
+    <p id="al-error" class="hidden rounded-lg bg-amber-100 p-3 text-sm text-amber-900"></p>
+    <form class="flex flex-wrap items-end gap-3 rounded-lg bg-white p-4 text-sm shadow" onsubmit="return false">
+      <label class="flex flex-col gap-1">Show
+        <select id="f-state" class="rounded bg-slate-100 px-2 py-1"><option value="all">Active and past</option><option value="active">Active only</option></select></label>
+      <label class="flex flex-col gap-1">Severity
+        <select id="f-severity" class="rounded bg-slate-100 px-2 py-1"><option value="all">Any</option><option value="critical">Critical</option><option value="high">High</option><option value="warning">Warning</option><option value="informational">Informational</option></select></label>
+      <label class="flex flex-col gap-1">Resource
+        <select id="f-resource" class="rounded bg-slate-100 px-2 py-1"><option value="all">Any</option><option value="cpu">CPU</option><option value="memory">Memory</option><option value="disk">Disk</option><option value="network">Network</option></select></label>
+      <label class="flex flex-col gap-1">Application or process
+        <input id="f-text" type="search" placeholder="name contains…" class="rounded bg-slate-100 px-2 py-1"></label>
+      <span id="al-count" class="text-slate-500"></span>
+    </form>
+    <div class="overflow-x-auto rounded-lg bg-white p-4 shadow">
+      <table class="w-full text-left text-sm">
+        <thead class="text-slate-500"><tr><th class="py-1 pr-3">Severity</th><th class="py-1 pr-3">Resource</th><th class="py-1 pr-3">Process</th><th class="py-1 pr-3 text-right">Actual</th><th class="py-1 pr-3 text-right">Baseline</th><th class="py-1 pr-3 text-right">Deviation</th><th class="py-1 pr-3">Detected</th><th class="py-1 pr-3 text-right">Lasted</th><th class="py-1">State</th></tr></thead>
+        <tbody id="al-rows"></tbody>
+      </table>
+      <p id="al-empty" class="hidden text-sm text-slate-500">No events match in the selected time range.</p>
+    </div>
+  </main>
+
+  <main id="view-anomaly" class="mx-auto hidden max-w-7xl space-y-4 p-4">
+    <a href="#/anomalies" class="inline-block text-sm text-sky-700 hover:underline">← All anomalies</a>
+    <p id="anomaly-error" class="hidden rounded-lg bg-amber-100 p-3 text-sm text-amber-900"></p>
+    <section class="rounded-lg bg-white p-4 shadow">
+      <div class="flex flex-wrap items-center gap-3"><h2 id="a-title" class="text-xl font-semibold">Loading…</h2><span id="a-severity" class="inline-block"></span></div>
+      <p id="a-state" class="text-sm text-slate-500"></p>
+      <dl id="a-facts" class="mt-3 grid grid-cols-1 gap-x-6 gap-y-1 text-sm sm:grid-cols-2"></dl>
+      <h3 class="mt-4 text-sm font-medium text-slate-500">Assessment</h3>
+      <p id="a-assessment" class="text-sm"></p>
+      <a id="a-subject" href="#/" class="mt-3 hidden text-sm text-sky-700 hover:underline">About this program: its page and baselines →</a>
+    </section>
+    <section aria-label="Around the event">
+      <h2 class="mb-2 text-lg font-semibold">Around the event</h2>
+      <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div id="a-chart-proc-box" class="rounded-lg bg-white p-4 shadow lg:col-span-2"><h3 id="a-chart-proc-title" class="mb-1 font-medium"></h3><div id="a-chart-proc" class="h-56 w-full"></div></div>
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">System CPU</h3><div id="a-chart-cpu" class="h-48 w-full"></div></div>
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">System memory in use</h3><div id="a-chart-mem" class="h-48 w-full"></div></div>
+        <div class="rounded-lg bg-white p-4 shadow"><h3 class="mb-1 font-medium">Disk busy</h3><div id="a-chart-disk" class="h-48 w-full"></div></div>
+      </div>
+      <p id="a-chart-note" class="mt-2 text-xs text-slate-500"></p>
     </section>
   </main>
 

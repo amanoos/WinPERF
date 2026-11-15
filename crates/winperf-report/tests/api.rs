@@ -520,3 +520,31 @@ async fn ranking_rows_say_which_detail_page_they_open() {
     assert_eq!(by_app["rows"][0]["subject"]["scope"], "application");
     assert_eq!(by_app["rows"][0]["subject"]["id"], 1);
 }
+
+#[tokio::test]
+async fn one_event_comes_with_the_process_and_system_around_it() {
+    let s = Scratch::new();
+    let (active, _) = seed(&s.db());
+    let app = app(settings(s.db(), None));
+
+    let (_, one) = local(&app, &format!("/api/anomalies/{active}")).await;
+    let ctx = &one["context"];
+    let from = ctx["from_ms"].as_i64().unwrap();
+    let to = ctx["to_ms"].as_i64().unwrap();
+    assert_eq!(
+        to - from,
+        20 * 60_000,
+        "ten minutes either side of an event that has not lasted"
+    );
+    assert_eq!(ctx["cut"], false);
+    let process = ctx["process"].as_array().unwrap();
+    assert_eq!(process.len(), 1, "one sample of busy.exe in the window");
+    assert_eq!(process[0]["cpu_percent"], 60.0);
+    assert!(
+        process[0]["net_bytes_per_sec"].is_null(),
+        "never measured stays null"
+    );
+    let system = ctx["system"].as_array().unwrap();
+    assert!(!system.is_empty());
+    assert_eq!(system[0]["cpu_percent"], 20.0);
+}

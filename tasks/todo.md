@@ -250,7 +250,12 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - AC: metadata, publisher, processes, history charts, baseline band overlay read from stored baselines (no recomputation in the report crate), anomalies list, execution history.
   - Verify: seeded app renders all sections; baseline values equal DB rows exactly.
   - Deps: T29, T17.
-- [ ] **T31: Anomaly investigation page** (M)
+- [x] **T31: Anomaly investigation page** (M)
+  - Done. Page `#/anomalies`: every event in the selected time range (up to 1,000) in a table with severity, resource, process and application, actual against baseline, deviation as a multiple, detection time, duration and state; filters for active only, severity, resource and a name search (application or process), applied in the browser. Page `#/anomalies/{id}`: the FR-027 layout (process, application, consumption, established baseline, deviation as a multiple and percent, duration, baseline confidence and window, system CPU, memory and disk at the time, pressure and share) with the stored explanation text as the assessment, a link to the program's own page, and charts around the event (ten minutes either side): the process's own use with the baseline as a dashed line and the active stretch shaded, and system CPU, memory and disk busy over the same time. Dashboard anomaly entries and the header link to it. API: `GET /api/anomalies/{id}` now adds `context` (process and system series for the window, cut to the event's first 3 hours when longer, `cut` says so) and `subject` (application, else executable); storage `instance_samples_between`.
+  - Memory-growth events show their rates per hour (bytes per hour), as stored; their chart is the working set without a baseline line, since the baseline there is a growth rate.
+  - Verified: API test for the context (window, the process's sample, null for never-measured network, system series); on the real recorded database in the in-app browser: 19 events listed, severity and resource filters change the counts (12 warnings, 2 CPU), a row opens its page with facts, explanation and the three charts. Not done: server-side filtering (filters are client-side over at most 1,000 events); linking back from the process chart to exact sample rows.
+  - Limits: an event still marked active after the recorder stopped stays active until the next recorder start resolves it.
+  - (Original AC below.)
   - AC: filters severity/app/resource; shows detail with explanation text and concurrent system metrics (FR-027 example layout); timeline chart.
   - Verify: seeded anomalies filter correctly; explanation text matches stored description.
   - Deps: T30, T21.

@@ -169,6 +169,41 @@ impl Database {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// One instance's samples with `from_ms <= ts_ms <= to_ms`, oldest first. Uses the time
+    /// index, so keep the window short (hours, not days) on a busy database.
+    pub fn instance_samples_between(
+        &self,
+        instance_id: i64,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<StoredSample>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT ts_ms, cpu_percent, working_set_bytes, private_bytes, virtual_bytes, \
+             peak_working_set_bytes, io_read_bytes_per_sec, io_write_bytes_per_sec, \
+             io_read_ops_per_sec, io_write_ops_per_sec, net_rx_bytes_per_sec, \
+             net_tx_bytes_per_sec FROM resource_samples \
+             WHERE ts_ms BETWEEN ?2 AND ?3 AND process_instance_id = ?1 ORDER BY ts_ms, id",
+        )?;
+        let big = |v: Option<i64>| v.map(|x| x as u64);
+        let rows = stmt.query_map(rusqlite::params![instance_id, from_ms, to_ms], |r| {
+            Ok(StoredSample {
+                ts_ms: r.get(0)?,
+                cpu_percent: r.get(1)?,
+                working_set_bytes: big(r.get(2)?),
+                private_bytes: big(r.get(3)?),
+                virtual_bytes: big(r.get(4)?),
+                peak_working_set_bytes: big(r.get(5)?),
+                io_read_bytes_per_sec: r.get(6)?,
+                io_write_bytes_per_sec: r.get(7)?,
+                io_read_ops_per_sec: r.get(8)?,
+                io_write_ops_per_sec: r.get(9)?,
+                net_rx_bytes_per_sec: r.get(10)?,
+                net_tx_bytes_per_sec: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// All system-wide samples, oldest first.
     pub fn system_samples(&self) -> Result<Vec<StoredSystemSample>> {
         self.system_samples_between(i64::MIN, i64::MAX)
