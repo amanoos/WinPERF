@@ -278,6 +278,7 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - Deps: T32.
 
 ### Checkpoint 6: MVP (PRD §11)
+- [ ] **Walkthrough prepared, waiting for the human.** `docs/mvp-walkthrough.md` maps each of the 12 MVP items to a command and what you should see, then the PRD section 9 sluggish-computer workflow step by step with sign-off questions, the known limits, and the Phase 7 scope decision. Everything it asks you to do has been run during Phases 1 to 6 (item evidence is in the T-entries above); the walkthrough itself needs you at the screen.
 - [ ] All 12 MVP items demonstrable end to end; human walkthrough of "computer is sluggish" workflow (PRD §9); decide on Phase 7 scope.
 
 ## Phase 7: Hardening
