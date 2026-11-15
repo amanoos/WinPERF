@@ -10,6 +10,7 @@ pub mod metric;
 pub mod network;
 pub mod process;
 pub mod profiler;
+pub mod redact;
 pub mod sampling;
 pub mod system;
 pub mod time;

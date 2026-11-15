@@ -107,6 +107,47 @@ mod tests {
             == 1
     }
 
+    /// T35: command lines can hold passwords and tokens, so no table may keep them. If a column that
+    /// looks like one is ever added, this fails and the change has to be a deliberate, redacted,
+    /// opt-in one (see `winperf_core::redact`).
+    #[test]
+    fn no_table_stores_command_lines() {
+        let db = Database::open_in_memory().unwrap();
+        let tables: Vec<String> = {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert!(tables.len() > 10);
+        for table in tables {
+            let mut stmt = db
+                .conn()
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            for column in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                let column = column.unwrap().to_lowercase();
+                // The one deliberate exception: the registry's uninstall command, which the
+                // inventory stores with its secrets redacted (see `save_installed_apps`).
+                if (table.as_str(), column.as_str())
+                    == ("installed_applications", "uninstall_command")
+                {
+                    continue;
+                }
+                assert!(
+                    !["command", "cmdline", "cmd_line", "arguments", "argv"]
+                        .iter()
+                        .any(|bad| column.contains(bad)),
+                    "{table}.{column} looks like a command line column"
+                );
+            }
+        }
+    }
+
     #[test]
     fn open_creates_schema_at_latest_version() {
         let db = Database::open_in_memory().unwrap();

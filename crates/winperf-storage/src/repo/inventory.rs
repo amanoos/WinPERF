@@ -130,7 +130,10 @@ impl Database {
                     a.version,
                     a.install_date,
                     a.install_location,
-                    a.uninstall_command,
+                    // A command line: secrets in it are hidden before it is stored.
+                    a.uninstall_command
+                        .as_deref()
+                        .map(winperf_core::redact::redact_command_line),
                     a.registry_sources.join(";"),
                     a.classification.as_str(),
                     now,
@@ -410,6 +413,23 @@ mod tests {
             registry_sources: vec!["HKLM32".into(), "HKLM64".into()],
             classification: Classification::Unknown,
         }
+    }
+
+    #[test]
+    fn a_secret_in_an_uninstall_command_is_not_stored() {
+        let mut db = Database::open_in_memory().unwrap();
+        let mut a = app("Vault", "1", "Acme");
+        a.uninstall_command = Some("setup.exe /uninstall --password hunter2 /quiet".into());
+        db.save_installed_apps(&[a], "2026-01-01 00:00:00").unwrap();
+        let stored: String = db
+            .conn()
+            .query_row(
+                "SELECT uninstall_command FROM installed_applications",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "setup.exe /uninstall --password *** /quiet");
     }
 
     fn bare_app(name: &str) -> InstalledApp {

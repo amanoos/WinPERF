@@ -301,6 +301,14 @@ enum InventoryAction {
     },
 }
 
+/// Restrict the standard data folder to administrators and this account (T35). Failure is a
+/// warning: the tool still works, the data is just as open as the folder already was.
+fn harden(db_path: &std::path::Path) {
+    if let Err(e) = winperf_runtime::secure_data_dir(db_path) {
+        eprintln!("winperf: could not restrict access to the data folder: {e}");
+    }
+}
+
 fn finish(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -334,14 +342,21 @@ fn run_service(action: &ServiceAction) -> Result<(), String> {
             exe,
             delayed_start,
             no_start,
-        } => commands::service::install(
-            &commands::service::InstallOptions {
-                exe: exe.clone(),
-                delayed_start: *delayed_start,
-                start: !no_start,
-            },
-            &mut out,
-        ),
+        } => {
+            // As the person installing it (not as SYSTEM, which the service runs as), so that
+            // they keep access to the data once the folder is restricted.
+            // (The service's own database is the standard one unless its config says otherwise,
+            // and a database placed elsewhere is not touched.)
+            harden(&winperf_runtime::default_data_dir().join("winperf.db"));
+            commands::service::install(
+                &commands::service::InstallOptions {
+                    exe: exe.clone(),
+                    delayed_start: *delayed_start,
+                    start: !no_start,
+                },
+                &mut out,
+            )
+        }
         ServiceAction::Uninstall => commands::service::uninstall(&mut out),
         ServiceAction::Start => commands::service::start(&mut out),
         ServiceAction::Stop => commands::service::stop(&mut out),
@@ -414,6 +429,7 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
                 .map_err(|e| format!("could not install Ctrl+C handler: {e}"))?;
             let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            harden(&db_path);
             // A flag given on the command line beats the config file.
             let settings = winperf_runtime::RunSettings {
                 interval_secs: interval,
@@ -543,6 +559,7 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
         }
         Command::Maintain { vacuum } => {
             let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            harden(&db_path);
             commands::maintain::run(
                 &db_path,
                 &config.retention,

@@ -4,6 +4,7 @@ use crate::export::{Format, processes_csv, processes_json};
 use std::io::{self, Write};
 use winperf_core::inventory::grouping::associate;
 use winperf_core::inventory::{InstalledApp, ProcessInfo, ProcessSource, SignatureVerifier, scan};
+use winperf_core::redact::redact_command_line;
 use winperf_core::time::filetime_to_utc_string;
 
 fn clip(s: &str, max: usize) -> String {
@@ -52,10 +53,12 @@ pub fn format_table(procs: &[ProcessInfo], applications: &[String], show_cmdline
             clip(application, 30)
         ));
         if show_cmdline {
-            out.push_str(&format!(
-                "  {}",
-                p.command_line.value().map_or("-", String::as_str)
-            ));
+            // Secrets on the command line (passwords, tokens) are hidden before it is shown.
+            let shown = p
+                .command_line
+                .value()
+                .map_or_else(|| "-".to_string(), |c| redact_command_line(c));
+            out.push_str(&format!("  {shown}"));
         }
         out.push('\n');
     }
@@ -160,6 +163,19 @@ mod tests {
         let t = format_table(&procs, &labels(&procs), false);
         assert!(t.contains("4*"), "{t}");
         assert!(t.contains("(1 with partial data"));
+    }
+
+    #[test]
+    fn secrets_on_a_command_line_are_not_shown() {
+        let v = Always(SignatureStatus::NotSigned);
+        let mut procs = scan(&Fixture(vec![readable()]), Some(&v));
+        procs[0].command_line = Metric::Available("app.exe --password hunter2 --port 80".into());
+        let shown = format_table(&procs, &labels(&procs), true);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(
+            shown.contains("--password ***") && shown.contains("--port 80"),
+            "{shown}"
+        );
     }
 
     #[test]

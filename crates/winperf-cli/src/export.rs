@@ -47,7 +47,8 @@ struct AppRecord<'a> {
     version: Option<&'a str>,
     install_date: Option<&'a str>,
     install_location: Option<&'a str>,
-    uninstall_command: Option<&'a str>,
+    /// Shown with its secrets hidden (an uninstall command is a command line).
+    uninstall_command: Option<String>,
     registry_sources: &'a [String],
     classification: &'static str,
 }
@@ -60,7 +61,10 @@ fn app_records(apps: &[InstalledApp]) -> Vec<AppRecord<'_>> {
             version: a.version.as_deref(),
             install_date: a.install_date.as_deref(),
             install_location: a.install_location.as_deref(),
-            uninstall_command: a.uninstall_command.as_deref(),
+            uninstall_command: a
+                .uninstall_command
+                .as_deref()
+                .map(winperf_core::redact::redact_command_line),
             registry_sources: &a.registry_sources,
             classification: a.classification.as_str(),
         })
@@ -93,7 +97,7 @@ pub fn apps_csv(apps: &[InstalledApp]) -> String {
             opt(a.version),
             opt(a.install_date),
             opt(a.install_location),
-            opt(a.uninstall_command),
+            opt(a.uninstall_command.as_deref()),
             a.registry_sources.join(";"),
             a.classification.to_string(),
         ]));
@@ -145,7 +149,9 @@ fn process_records(
             application: assoc.label,
             partial: p.is_partial(),
             command_line: if include_cmdline {
-                p.command_line.value().cloned()
+                p.command_line
+                    .value()
+                    .map(|c| winperf_core::redact::redact_command_line(c))
             } else {
                 None
             },
@@ -314,7 +320,10 @@ mod tests {
         assert!(!processes_json(&procs, &apps, false).contains("SECRET"));
 
         let on: Value = serde_json::from_str(&processes_json(&procs, &apps, true)).unwrap();
-        assert_eq!(on[0]["command_line"], "a.exe --token=SECRET");
+        // Asked for, the command line is shown, but its secret is not.
+        assert_eq!(on[0]["command_line"], "a.exe --token=***");
+        assert!(!processes_json(&procs, &apps, true).contains("SECRET"));
+        assert!(!processes_csv(&procs, &apps, true).contains("SECRET"));
     }
 
     #[test]

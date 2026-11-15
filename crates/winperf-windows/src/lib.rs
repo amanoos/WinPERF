@@ -1,5 +1,6 @@
 //! Windows-specific collectors and integrations. All `unsafe` FFI is confined to this crate.
 
+pub mod acl;
 pub mod etw;
 pub mod metrics;
 pub mod processes;
