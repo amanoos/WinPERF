@@ -1,5 +1,6 @@
 //! WinPerf core engine: pure logic with no Windows or UI dependencies.
 
+pub mod anomaly;
 pub mod classification;
 pub mod config;
 pub mod engine;

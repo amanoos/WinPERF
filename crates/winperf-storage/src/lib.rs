@@ -1,6 +1,7 @@
 //! SQLite storage layer (schema, migrations, repositories).
 
 pub mod db;
+pub mod detect;
 pub mod error;
 pub mod migrations;
 pub mod paths;
@@ -8,12 +9,15 @@ pub mod repo;
 pub mod sink;
 
 pub use db::Database;
+pub use detect::{DetectSettings, DetectingSink};
 pub use error::{Result, StorageError};
 pub use paths::{
     ConfigLocation, ENV_CONFIG, ENV_DB, config_location, default_db_path, resolve_config_location,
     resolve_db_path,
 };
-pub use repo::{FileIdentity, ListedBaseline, ProfileState, RecomputeReport, StoredBaseline};
+pub use repo::{
+    FileIdentity, ListedBaseline, ProfileState, RecomputeReport, StoredAnomaly, StoredBaseline,
+};
 pub use sink::DbSink;
 
 /// Crate name, used by front ends for diagnostics.

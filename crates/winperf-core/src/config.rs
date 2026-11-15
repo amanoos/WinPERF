@@ -30,6 +30,29 @@ pub enum Resource {
     Network,
 }
 
+impl Resource {
+    pub const ALL: [Resource; 4] = [
+        Resource::Cpu,
+        Resource::Memory,
+        Resource::Disk,
+        Resource::Network,
+    ];
+
+    /// The stable name stored in the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Resource::Cpu => "cpu",
+            Resource::Memory => "memory",
+            Resource::Disk => "disk",
+            Resource::Network => "network",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MonitorConfig {

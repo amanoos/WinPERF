@@ -11,13 +11,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use winperf_core::config::Config;
+use winperf_core::config::{Config, Resource};
 use winperf_core::inventory::{
     BackgroundClassifier, CachedVerifier, ExecutableClassifier, SignatureVerifier, discover,
 };
 use winperf_core::network::NetworkStatus;
 use winperf_core::time::unix_millis_now;
-use winperf_storage::{ConfigLocation, Database, resolve_config_location, resolve_db_path};
+use winperf_storage::{
+    ConfigLocation, Database, DetectSettings, resolve_config_location, resolve_db_path,
+};
 use winperf_windows::{
     EtwNetworkCollector, WinTrustVerifier, WindowsMetricsSource, WindowsProcessSource,
     WindowsRegistry, WindowsSystemSource, WindowsVersionReader,
@@ -72,6 +74,11 @@ enum Command {
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
+    },
+    /// Anomalies the monitor has detected
+    Anomalies {
+        #[command(subcommand)]
+        action: AnomaliesAction,
     },
     /// Show or create the configuration file
     Config {
@@ -129,6 +136,24 @@ enum ProfileAction {
     Stop,
     /// Show the mode, whether a monitor is running, and baseline confidence so far
     Status,
+}
+
+#[derive(Subcommand)]
+enum AnomaliesAction {
+    /// List detected anomalies, newest first
+    List {
+        /// Only those from the last this many hours
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        hours: Option<u32>,
+        /// Most events to show
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        limit: u32,
+    },
+    /// Show everything about one anomaly, including why it was raised
+    Show {
+        /// The event id from `anomalies list`
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -317,10 +342,18 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 Duration::from_secs(u64::from(config.baseline.recompute_minutes) * 60),
                 Arc::clone(&stop),
             );
+            let detect = DetectSettings::new(
+                config.detection.for_resource(Resource::Cpu),
+                config.baseline.windows_hours.clone(),
+                config.baseline.confidence.clone(),
+            );
             let result = commands::monitor::run(
                 metrics,
                 &db_path,
-                classifier,
+                commands::monitor::Options {
+                    classifier,
+                    detect: Some(detect),
+                },
                 Duration::from_secs(interval),
                 ticks,
                 &stop,
@@ -346,6 +379,20 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                     let window = window.unwrap_or_else(|| windows.first().copied().unwrap_or(1));
                     commands::baseline::list(&db, window, &config.baseline.confidence, &mut out)
                         .map_err(io)
+                }
+            }
+        }
+        Command::Anomalies { action } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
+            let mut out = std::io::stdout().lock();
+            match action {
+                AnomaliesAction::List { hours, limit } => {
+                    commands::anomalies::list(&db, hours, limit, unix_millis_now(), &mut out)
+                        .map_err(|e| e.to_string())
+                }
+                AnomaliesAction::Show { id } => {
+                    commands::anomalies::show(&db, id, &mut out).map_err(|e| e.to_string())
                 }
             }
         }

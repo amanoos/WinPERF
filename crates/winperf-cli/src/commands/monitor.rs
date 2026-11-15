@@ -4,9 +4,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use winperf_core::engine::{Engine, MetricsSource, TickStats};
+use winperf_core::engine::{Engine, MetricsSource, SampleSink, TickStats};
 use winperf_core::inventory::ExecutableClassifier;
-use winperf_storage::{Database, DbSink};
+use winperf_storage::{Database, DbSink, DetectSettings, DetectingSink};
 
 /// One progress line per tick.
 pub fn format_tick(n: u64, s: &TickStats) -> String {
@@ -20,22 +20,25 @@ pub fn format_tick(n: u64, s: &TickStats) -> String {
     )
 }
 
-/// Run the engine against an already-open database. Returns the number of ticks run.
-pub fn run_with<M: MetricsSource>(
+/// What a run does besides recording samples.
+#[derive(Default)]
+pub struct Options {
+    /// Verifies the signatures of newly seen executables in the background.
+    pub classifier: Option<Box<dyn ExecutableClassifier>>,
+    /// Checks every tick for anomalies and stores them.
+    pub detect: Option<DetectSettings>,
+}
+
+/// Drive `sink` until `stop` or `max_ticks`, printing a line per tick. Hands the sink back so the
+/// caller can report on it.
+fn drive<M: MetricsSource, S: SampleSink>(
     metrics: M,
-    db: Database,
-    classifier: Option<Box<dyn ExecutableClassifier>>,
+    sink: S,
     interval: Duration,
     max_ticks: Option<u64>,
     stop: &AtomicBool,
     out: &mut impl Write,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    // Several ticks per transaction (about 6 at the default 5 s): far less disk writing, and at
-    // most that much sampling time is lost if the process is killed. A normal stop flushes.
-    let mut sink = DbSink::new(db).with_flush_span(winperf_storage::sink::DEFAULT_FLUSH_SPAN);
-    if let Some(c) = classifier {
-        sink = sink.with_classifier(c);
-    }
+) -> Result<(u64, S), Box<dyn std::error::Error>> {
     let mut engine = Engine::new(metrics, sink);
     let mut write_error: Option<io::Error> = None;
     let ticks = engine.run(interval, max_ticks, stop, |n, stats| {
@@ -47,15 +50,52 @@ pub fn run_with<M: MetricsSource>(
     })?;
     match write_error {
         Some(e) => Err(e.into()),
-        None => Ok(ticks),
+        None => Ok((ticks, engine.into_parts().1)),
     }
+}
+
+/// Run the engine against an already-open database. Returns the number of ticks run. With
+/// `detect` set, every tick is also checked for anomalies, which are stored as they are found.
+pub fn run_with<M: MetricsSource>(
+    metrics: M,
+    db: Database,
+    options: Options,
+    interval: Duration,
+    max_ticks: Option<u64>,
+    stop: &AtomicBool,
+    out: &mut impl Write,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    // Several ticks per transaction (about 6 at the default 5 s): far less disk writing, and at
+    // most that much sampling time is lost if the process is killed. A normal stop flushes.
+    let mut sink = DbSink::new(db).with_flush_span(winperf_storage::sink::DEFAULT_FLUSH_SPAN);
+    if let Some(c) = options.classifier {
+        sink = sink.with_classifier(c);
+    }
+    let Some(settings) = options.detect else {
+        return drive(metrics, sink, interval, max_ticks, stop, out).map(|(ticks, _)| ticks);
+    };
+    let (ticks, sink) = drive(
+        metrics,
+        DetectingSink::new(sink, settings),
+        interval,
+        max_ticks,
+        stop,
+        out,
+    )?;
+    if sink.raised() > 0 {
+        writeln!(out, "{} anomaly event(s) raised", sink.raised())?;
+    }
+    if let Some(problem) = sink.last_error() {
+        writeln!(out, "anomaly detection had a problem: {problem}")?;
+    }
+    Ok(ticks)
 }
 
 /// Open (creating/migrating) the database at `db_path` and run until `stop` or `max_ticks`.
 pub fn run<M: MetricsSource>(
     metrics: M,
     db_path: &Path,
-    classifier: Option<Box<dyn ExecutableClassifier>>,
+    options: Options,
     interval: Duration,
     max_ticks: Option<u64>,
     stop: &AtomicBool,
@@ -64,16 +104,21 @@ pub fn run<M: MetricsSource>(
     let db = Database::open(db_path)?;
     writeln!(
         out,
-        "monitoring every {}s, writing to {} (Ctrl+C to stop){}",
+        "monitoring every {}s, writing to {} (Ctrl+C to stop){}{}",
         interval.as_secs(),
         db_path.display(),
-        if classifier.is_some() {
+        if options.classifier.is_some() {
             ""
         } else {
             "; signature checks off"
+        },
+        if options.detect.is_some() {
+            "; anomaly detection on"
+        } else {
+            ""
         }
     )?;
-    let ticks = run_with(metrics, db, classifier, interval, max_ticks, stop, out)?;
+    let ticks = run_with(metrics, db, options, interval, max_ticks, stop, out)?;
     writeln!(out, "stopped after {ticks} ticks")?;
     Ok(ticks)
 }
@@ -140,7 +185,7 @@ mod tests {
         let ticks = run(
             script,
             &db_path,
-            None,
+            Options::default(),
             Duration::from_millis(10),
             Some(2),
             &stop,

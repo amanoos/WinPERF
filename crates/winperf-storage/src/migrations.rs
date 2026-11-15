@@ -35,6 +35,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0007_profile_state",
         include_str!("../migrations/0007_profile_state.sql"),
     ),
+    (
+        "0008_anomaly_events",
+        include_str!("../migrations/0008_anomaly_events.sql"),
+    ),
 ];
 
 /// Highest schema version this build understands.

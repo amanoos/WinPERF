@@ -1,5 +1,6 @@
 //! Non-interactive subcommands.
 
+pub mod anomalies;
 pub mod baseline;
 pub mod config;
 pub mod inventory;
