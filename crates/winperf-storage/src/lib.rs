@@ -16,8 +16,8 @@ pub use paths::{
     resolve_db_path,
 };
 pub use repo::{
-    AnomalyFilter, ExecutableRow, FileIdentity, ListedBaseline, ProfileState, RecomputeReport,
-    SampleHealth, StoredAnomaly, StoredBaseline, StoredSystemSample,
+    AnomalyFilter, CurrentProcess, ExecutableRow, FileIdentity, ListedBaseline, ProfileState,
+    RecomputeReport, SampleHealth, StoredAnomaly, StoredBaseline, StoredSystemSample,
 };
 pub use sink::DbSink;
 

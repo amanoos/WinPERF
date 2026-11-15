@@ -209,6 +209,21 @@ impl Database {
     }
 }
 
+/// One process's reading at the newest tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentProcess {
+    pub pid: u32,
+    pub name: String,
+    pub application: Option<String>,
+    pub cpu_percent: Option<f64>,
+    pub working_set_bytes: Option<u64>,
+    pub private_bytes: Option<u64>,
+    pub io_read_bytes_per_sec: Option<f64>,
+    pub io_write_bytes_per_sec: Option<f64>,
+    pub net_rx_bytes_per_sec: Option<f64>,
+    pub net_tx_bytes_per_sec: Option<f64>,
+}
+
 /// How continuous the recording has been over a period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SampleHealth {
@@ -224,6 +239,44 @@ pub struct SampleHealth {
 }
 
 impl Database {
+    /// The processes of the newest tick (when any were recorded), busiest CPU first, at most
+    /// `limit`. Returns the tick's time with them.
+    pub fn current_processes(&self, limit: u32) -> Result<(Option<i64>, Vec<CurrentProcess>)> {
+        let ts: Option<i64> =
+            self.conn()
+                .query_row("SELECT MAX(ts_ms) FROM resource_samples", [], |r| r.get(0))?;
+        let Some(ts) = ts else {
+            return Ok((None, Vec::new()));
+        };
+        let mut stmt = self.conn().prepare(
+            "SELECT pi.pid, pi.name, ia.name, rs.cpu_percent, rs.working_set_bytes, \
+                    rs.private_bytes, rs.io_read_bytes_per_sec, rs.io_write_bytes_per_sec, \
+                    rs.net_rx_bytes_per_sec, rs.net_tx_bytes_per_sec \
+             FROM resource_samples rs \
+             JOIN process_instances pi ON pi.id = rs.process_instance_id \
+             LEFT JOIN installed_applications ia ON ia.id = pi.application_id \
+             WHERE rs.ts_ms = ?1 \
+             ORDER BY rs.cpu_percent IS NULL, rs.cpu_percent DESC, rs.working_set_bytes DESC \
+             LIMIT ?2",
+        )?;
+        let big = |v: Option<i64>| v.map(|x| x as u64);
+        let rows = stmt.query_map(params![ts, limit], |r| {
+            Ok(CurrentProcess {
+                pid: r.get(0)?,
+                name: r.get(1)?,
+                application: r.get(2)?,
+                cpu_percent: r.get(3)?,
+                working_set_bytes: big(r.get(4)?),
+                private_bytes: big(r.get(5)?),
+                io_read_bytes_per_sec: r.get(6)?,
+                io_write_bytes_per_sec: r.get(7)?,
+                net_rx_bytes_per_sec: r.get(8)?,
+                net_tx_bytes_per_sec: r.get(9)?,
+            })
+        })?;
+        Ok((Some(ts), rows.collect::<std::result::Result<Vec<_>, _>>()?))
+    }
+
     /// Continuity of the system samples since `since_ms`: how many, and how many gaps longer than
     /// `gap_ms` (the monitor was stopped, the machine slept, or sampling failed).
     pub fn sample_health(&self, since_ms: i64, gap_ms: i64) -> Result<SampleHealth> {

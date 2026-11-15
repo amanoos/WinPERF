@@ -11,4 +11,4 @@ pub use anomalies::{AnomalyFilter, StoredAnomaly};
 pub use baselines::{ListedBaseline, RecomputeReport, StoredBaseline};
 pub use inventory::{ExecutableRow, FileIdentity};
 pub use profile::ProfileState;
-pub use samples::{SampleHealth, StoredSample, StoredSystemSample};
+pub use samples::{CurrentProcess, SampleHealth, StoredSample, StoredSystemSample};

@@ -155,6 +155,42 @@ pub struct Config {
     pub retention: RetentionConfig,
     pub detection: DetectionConfig,
     pub baseline: BaselineConfig,
+    pub report: ReportConfig,
+}
+
+/// The browser report server (`winperf-report`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReportConfig {
+    /// Address to listen on. Only the machine itself (127.0.0.1 or ::1) is allowed unless a
+    /// token is set; reaching the report from another machine is a deliberate choice.
+    pub bind: String,
+    /// TCP port (8080 is often taken by system services, so the default is 8099).
+    pub port: u16,
+    /// Secret the browser must send (as a bearer token or `?token=`) when set. Required for a
+    /// bind address other than the local machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl Default for ReportConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1".into(),
+            port: 8099,
+            token: None,
+        }
+    }
+}
+
+/// Shortest token accepted: long enough that guessing it is not a realistic attack.
+pub const MIN_TOKEN_LEN: usize = 16;
+
+impl ReportConfig {
+    /// The listen address as an IP, if `bind` is one.
+    pub fn bind_ip(&self) -> Option<std::net::IpAddr> {
+        self.bind.trim().parse().ok()
+    }
 }
 
 impl Default for MonitorConfig {
@@ -266,6 +302,14 @@ established_observations = 1000
 established_minutes = 120
 high_observations = 10000
 high_minutes = 1440
+
+[report]
+# The browser report (winperf-report). It listens on this machine only by default.
+bind = "127.0.0.1"
+port = 8099
+# To reach it from other machines, set bind to this machine's address and choose a secret of at
+# least 16 characters; the browser must then send it (Authorization: Bearer ..., or ?token=...).
+# token = "choose-a-long-random-secret"
 "#;
 
 impl Config {
@@ -356,6 +400,29 @@ impl Config {
             && db.as_os_str().is_empty()
         {
             problems.push("storage.database must not be empty (omit it for the default)".into());
+        }
+
+        if self.report.port == 0 {
+            problems.push("report.port must be between 1 and 65535".into());
+        }
+        match self.report.bind_ip() {
+            None => problems.push(format!(
+                "report.bind must be an IP address such as 127.0.0.1 (got {:?})",
+                self.report.bind
+            )),
+            Some(ip) if !ip.is_loopback() && self.report.token.is_none() => {
+                problems.push(format!(
+                    "report.bind {ip} is reachable from other machines: set report.token (at least {MIN_TOKEN_LEN} characters) or use 127.0.0.1"
+                ));
+            }
+            Some(_) => {}
+        }
+        if let Some(token) = &self.report.token
+            && token.chars().count() < MIN_TOKEN_LEN
+        {
+            problems.push(format!(
+                "report.token must be at least {MIN_TOKEN_LEN} characters"
+            ));
         }
 
         if problems.is_empty() {
@@ -602,6 +669,30 @@ mod tests {
             !Config::default().to_toml_string().contains("database"),
             "None is omitted"
         );
+    }
+
+    #[test]
+    fn the_report_listens_locally_by_default_and_needs_a_token_to_go_further() {
+        let c = Config::default();
+        assert_eq!((c.report.bind.as_str(), c.report.port), ("127.0.0.1", 8099));
+        assert!(c.report.token.is_none());
+
+        let parse = |text: &str| Config::from_toml_str(text).map(|c| c.report);
+        assert!(parse("[report]\nbind = \"::1\"\nport = 9000\n").is_ok());
+        let open = parse("[report]\nbind = \"0.0.0.0\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(open.contains("report.token"), "{open}");
+        let short = parse("[report]\nbind = \"0.0.0.0\"\ntoken = \"short\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(short.contains("at least 16"), "{short}");
+        assert!(parse("[report]\nbind = \"0.0.0.0\"\ntoken = \"a-long-enough-secret\"\n").is_ok());
+        assert!(
+            parse("[report]\nbind = \"localhost\"\n").is_err(),
+            "not an IP"
+        );
+        assert!(parse("[report]\nport = 0\n").is_err());
     }
 
     #[test]
