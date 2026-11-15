@@ -186,7 +186,10 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
 
 ## Phase 5: Windows Service
 
-- [ ] **T24: Service host (runs the shared engine, no TUI)** (M)
+- [x] **T24: Service host (runs the shared engine, no TUI)** (M)
+  - Done, partly verified. New crate `winperf-runtime` holds the monitoring run (moved from the CLI: `monitor`, the baseline `schedule`, and `run_configured`, which builds classifier, network collector, schedule and detection from the config); `winperf monitor run` and `winperf-service` both call it. `winperf-service` (windows-service 0.8, no unsafe in our code) registers with the SCM, reports Running, accepts Stop and Shutdown, stops the engine and reports Stopped (exit code 1 if the engine failed or ended by itself, so T25 recovery can restart it); `winperf-service run` runs it in the foreground until Ctrl+C. Log: `%ProgramData%\WinPerf\logs\service.log` (UTC lines, moved to `.old` past 5 MiB); anomalies stay in the database, per-tick lines are not logged.
+  - Verified: foreground run against a scratch database wrote samples and a valid log (integrity ok); unit tests for the log; full check passes. NOT verified: running under the real SCM (`sc create`, start/stop, samples while logged out), because installing a service changes the machine and needs administrator rights; T25 adds the install command to do this.
+  - Deviations: logging is a small own file writer, not `tracing`; Pause/Continue is not offered (only Stop and Shutdown), since a paused monitor would silently leave gaps; use profiling mode or stop the service instead.
   - AC: `winperf-service` uses windows-service crate; SCM start/stop/pause states; runs engine with the same crate code path as foreground `monitor`; logs via tracing to file.
   - Verify: install manually with `sc create`, start/stop; samples written while no user is interactive.
   - Deps: T21. Files: `service/main.rs`, `windows/service.rs`.

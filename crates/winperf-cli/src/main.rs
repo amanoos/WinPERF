@@ -11,16 +11,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use winperf_core::anomaly::Sensitivities;
 use winperf_core::config::Config;
-use winperf_core::inventory::{
-    BackgroundClassifier, CachedVerifier, ExecutableClassifier, SignatureVerifier, discover,
-};
+use winperf_core::inventory::{CachedVerifier, SignatureVerifier, discover};
 use winperf_core::network::NetworkStatus;
 use winperf_core::time::unix_millis_now;
-use winperf_storage::{
-    ConfigLocation, Database, DetectSettings, resolve_config_location, resolve_db_path,
-};
+use winperf_storage::{ConfigLocation, Database, resolve_config_location, resolve_db_path};
 use winperf_windows::{
     EtwNetworkCollector, WinTrustVerifier, WindowsMetricsSource, WindowsProcessSource,
     WindowsRegistry, WindowsSystemSource, WindowsVersionReader,
@@ -344,55 +339,21 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 .map_err(|e| format!("could not install Ctrl+C handler: {e}"))?;
             let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
             // A flag given on the command line beats the config file.
-            let interval = interval.unwrap_or(config.monitor.interval_secs);
-            let verify_signatures = config.monitor.signatures && !no_signatures;
-            // Signature verification runs on its own thread so it can never delay a sampling tick.
-            let classifier: Option<Box<dyn ExecutableClassifier>> = verify_signatures.then(|| {
-                Box::new(BackgroundClassifier::spawn(
-                    WinTrustVerifier,
-                    WindowsVersionReader,
-                )) as Box<dyn ExecutableClassifier>
-            });
-            // Per-process network attribution needs administrator rights. Without them the monitor
-            // carries on and records network as "unavailable"; it never fails because of this.
-            let mut metrics = WindowsMetricsSource::new();
-            if config.monitor.network && !no_network {
-                match EtwNetworkCollector::start() {
-                    Ok(collector) => {
-                        metrics = metrics.with_network(collector);
-                        eprintln!("winperf: per-process network attribution is active");
-                    }
-                    Err(status) => eprintln!("winperf: {}", status.describe()),
-                }
-            }
-            // Baselines are recomputed in the background on their own connection.
-            let schedule = commands::baseline::spawn_schedule(
-                db_path.clone(),
-                config.baseline.windows_hours.clone(),
-                Duration::from_secs(u64::from(config.baseline.recompute_minutes) * 60),
-                Arc::clone(&stop),
-            );
-            let detect = DetectSettings::new(
-                Sensitivities::from_config(&config.detection),
-                config.baseline.windows_hours.clone(),
-                config.baseline.confidence.clone(),
-            );
-            let result = commands::monitor::run(
-                metrics,
+            let settings = winperf_runtime::RunSettings {
+                interval_secs: interval,
+                max_ticks: ticks,
+                no_signatures,
+                no_network,
+                bell: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            };
+            let result = winperf_runtime::run_configured(
+                &config,
                 &db_path,
-                commands::monitor::Options {
-                    classifier,
-                    detect: Some(detect),
-                    bell: std::io::IsTerminal::is_terminal(&std::io::stdout()),
-                },
-                Duration::from_secs(interval),
-                ticks,
+                &settings,
                 &stop,
                 &mut std::io::stdout().lock(),
+                &mut |line| eprintln!("winperf: {line}"),
             );
-            // A run that ended by itself (--ticks) never set the flag; stop the schedule too.
-            stop.store(true, Ordering::Relaxed);
-            let _ = schedule.join();
             result.map(|_| ()).map_err(|e| e.to_string())
         }
         Command::Baseline { action } => {

@@ -2490,6 +2490,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags 2.13.2",
+ "widestring",
+ "windows-sys",
+]
+
+[[package]]
 name = "windows-strings"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2599,6 +2610,7 @@ dependencies = [
  "serde",
  "serde_json",
  "winperf-core",
+ "winperf-runtime",
  "winperf-storage",
  "winperf-windows",
 ]
@@ -2622,12 +2634,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "winperf-service"
+name = "winperf-runtime"
 version = "0.1.0"
 dependencies = [
  "winperf-core",
  "winperf-storage",
  "winperf-windows",
+]
+
+[[package]]
+name = "winperf-service"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "windows-service",
+ "winperf-core",
+ "winperf-runtime",
+ "winperf-storage",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@ members = [
     "crates/winperf-core",
     "crates/winperf-windows",
     "crates/winperf-storage",
+    "crates/winperf-runtime",
     "crates/winperf-cli",
     "crates/winperf-service",
     "crates/winperf-report",
