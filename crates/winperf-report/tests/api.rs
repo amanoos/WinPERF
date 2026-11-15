@@ -286,7 +286,7 @@ async fn only_requests_addressed_to_localhost_are_answered() {
 }
 
 #[tokio::test]
-async fn a_configured_token_is_required_on_every_request() {
+async fn a_configured_token_is_required_for_the_data() {
     let s = Scratch::new();
     seed(&s.db());
     let secret = "a-long-enough-secret";
@@ -296,8 +296,11 @@ async fn a_configured_token_is_required_on_every_request() {
     assert_eq!(code, StatusCode::UNAUTHORIZED);
     let (code, _, _) = get(app.clone(), "/api/status", host, Some("wrong")).await;
     assert_eq!(code, StatusCode::UNAUTHORIZED);
-    let (code, _, _) = get(app.clone(), "/", host, None).await;
-    assert_eq!(code, StatusCode::UNAUTHORIZED, "the page needs it too");
+    // The page and its scripts hold no data, so they load without it; the data does not.
+    for path in ["/", "/app.js", "/app.css", "/echarts.min.js"] {
+        let (code, _, _) = get(app.clone(), path, host, None).await;
+        assert_eq!(code, StatusCode::OK, "{path}");
+    }
     let (code, _, _) = get(app.clone(), "/api/status", host, Some(secret)).await;
     assert_eq!(code, StatusCode::OK);
     let (code, _, _) = get(

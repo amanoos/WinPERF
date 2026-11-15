@@ -55,20 +55,43 @@ pub fn bind_address(config: &ReportConfig, port: Option<u16>) -> Result<SocketAd
     Ok(SocketAddr::new(ip, port.unwrap_or(config.port)))
 }
 
-const HOME: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>WinPerf report</title></head>\
-<body><h1>WinPerf report</h1><p>The report server is running. The dashboard arrives in the next task; the data is available now:</p>\
-<ul><li><a href=\"/api/status\">/api/status</a></li><li><a href=\"/api/current\">/api/current</a></li>\
-<li><a href=\"/api/system\">/api/system</a></li><li><a href=\"/api/anomalies\">/api/anomalies</a></li></ul></body></html>";
+/// The dashboard files, built into the program so it needs nothing installed beside it and nothing
+/// from the internet. `app.css` is generated from the other two (see `build-css.ps1`).
+const INDEX: &str = include_str!("../web/index.html");
+const APP_JS: &str = include_str!("../web/app.js");
+const APP_CSS: &str = include_str!("../web/app.css");
+const ECHARTS: &str = include_str!("../web/echarts.min.js");
 
-async fn home() -> axum::response::Html<&'static str> {
-    axum::response::Html(HOME)
+/// Paths that serve the page itself: no data, so no token is asked for (the data is in `/api`).
+pub(crate) fn is_page_asset(path: &str) -> bool {
+    matches!(path, "/" | "/app.css" | "/app.js" | "/echarts.min.js")
+}
+
+fn asset(content_type: &'static str, body: &'static str) -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, content_type)], body)
+}
+
+async fn index() -> impl axum::response::IntoResponse {
+    asset("text/html; charset=utf-8", INDEX)
+}
+async fn app_js() -> impl axum::response::IntoResponse {
+    asset("text/javascript; charset=utf-8", APP_JS)
+}
+async fn app_css() -> impl axum::response::IntoResponse {
+    asset("text/css; charset=utf-8", APP_CSS)
+}
+async fn echarts_js() -> impl axum::response::IntoResponse {
+    asset("text/javascript; charset=utf-8", ECHARTS)
 }
 
 /// The full application: the API, the guards (host, token, security headers) around it.
 pub fn app(settings: ReportSettings) -> Router {
     let shared: Shared = Arc::new(settings);
     Router::new()
-        .route("/", get(home))
+        .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/app.css", get(app_css))
+        .route("/echarts.min.js", get(echarts_js))
         .route("/api/status", get(api::status))
         .route("/api/current", get(api::current))
         .route("/api/system", get(api::system))

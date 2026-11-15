@@ -4,7 +4,7 @@
 //! * **Host check** (loopback binds): only `localhost`, `127.0.0.1` and `[::1]` are accepted as the
 //!   `Host`, so a web page on another site cannot reach the report through a DNS name that points
 //!   at 127.0.0.1 (DNS rebinding).
-//! * **Token**: when configured, every request must send it, as `Authorization: Bearer <token>` or
+//! * **Token**: when configured, every data request (`/api`) must send it, as `Authorization: Bearer <token>` or
 //!   a `token` query parameter. The comparison takes the same time whatever the guess.
 //! * **Headers**: no caching, no sniffing, no framing, and a policy that allows nothing but this
 //!   server's own files, so the page can never pull in anything from elsewhere.
@@ -86,7 +86,11 @@ pub async fn guard(State(shared): State<Shared>, request: Request<Body>, next: N
             ));
         }
     }
-    if let Some(wanted) = &shared.token {
+    if let Some(wanted) = shared
+        .token
+        .as_ref()
+        .filter(|_| !crate::is_page_asset(request.uri().path()))
+    {
         let from_header = request
             .headers()
             .get(header::AUTHORIZATION)
