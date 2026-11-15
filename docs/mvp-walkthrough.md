@@ -19,9 +19,9 @@ clean slate, add `--db C:\temp\walk.db` to every command (and to `winperf-report
 | 5 | Memory monitoring | Same dashboard | Memory in use, and per-process working set | [x] |
 | 6 | Disk I/O | Same dashboard; `winperf system now` | Disk busy, throughput and per-process I/O | [x] |
 | 7 | Network I/O | `winperf system now`; in an **elevated** prompt `winperf network now` | System network rates; with administrator rights, the processes using the network (without it, the tool says per-process network is unavailable) | [x] |
-| 8 | Historical SQLite storage | `winperf monitor run` for a few minutes (Ctrl+C), then `winperf monitor status` | Sample counts and the database size growing; the file exists at the path shown | [ ] |
+| 8 | Historical SQLite storage | `winperf monitor run` for a few minutes (Ctrl+C), then `winperf monitor status` | Sample counts and the database size growing; the file exists at the path shown | [x] |
 | 9 | Baseline generation | `winperf baseline update`, then `winperf baseline list` | A baseline (typical, p95, peak, confidence) per program | [x] |
-| 10 | Statistical anomaly detection | `winperf anomalies list` and `winperf anomalies show <id>` | Detected events with severity, actual vs baseline, and the explanation text | [ ] |
+| 10 | Statistical anomaly detection | `winperf anomalies list` and `winperf anomalies show <id>` | Detected events with severity, actual vs baseline, and the explanation text | [x] |
 | 11 | Ratatui terminal dashboard | `winperf tui` | System health header, sortable process table, anomaly view, settings | [x] |
 | 12 | Basic browser reporting | `winperf-report` then open http://localhost:8099 | The dashboard (see Part 3) | [x] |
 
@@ -86,6 +86,6 @@ diagnostics (ETW disk attribution, for example) stays out unless you pull it in.
 
 ## Sign-off
 
-- MVP items seen working: ___ / 12
-- Sluggish-computer workflow usable: yes / no / with changes: ______________________
-- Phase 7 scope: as planned / changes: ______________________
+- MVP items seen working: 12 / 12 (2026-11-15)
+- Sluggish-computer workflow usable: yes ("everything checks out"; Part 3 boxes were not individually ticked)
+- Phase 7 scope: as planned (T34, T35, T36)
