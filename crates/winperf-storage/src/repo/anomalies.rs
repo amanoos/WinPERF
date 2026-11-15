@@ -30,12 +30,37 @@ pub struct StoredAnomaly {
     pub baseline_window_hours: u32,
     pub baseline_confidence: String,
     pub explanation: String,
+    /// When the condition ended; `None` while the event is active.
+    pub resolved_ts_ms: Option<i64>,
+    /// When the event was last confirmed or refreshed.
+    pub last_update_ts_ms: i64,
+    pub system_disk_percent: Option<f64>,
+    pub pressure_percent: Option<f64>,
+    pub share_percent: Option<f64>,
+    pub impact_score: Option<f64>,
+}
+
+impl StoredAnomaly {
+    pub fn is_active(&self) -> bool {
+        self.resolved_ts_ms.is_none()
+    }
+}
+
+/// Which events to list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnomalyFilter {
+    /// Only events that were active at or after this time (still going on, or resolved since).
+    pub since_ms: Option<i64>,
+    /// Only events that are still going on.
+    pub active_only: bool,
 }
 
 const COLUMNS: &str = "id, detected_ts_ms, process_instance_id, pid, process_name, application, \
                        exe_path, resource, current_value, baseline_value, deviation_pct, \
                        duration_ms, severity, system_cpu_percent, system_memory_percent, \
-                       baseline_window_hours, baseline_confidence, explanation, kind";
+                       baseline_window_hours, baseline_confidence, explanation, kind, \
+                       resolved_ts_ms, last_update_ts_ms, system_disk_percent, \
+                       pressure_percent, share_percent, impact_score";
 
 fn from_row(r: &rusqlite::Row<'_>) -> Result<StoredAnomaly> {
     let resource: String = r.get(7)?;
@@ -66,6 +91,12 @@ fn from_row(r: &rusqlite::Row<'_>) -> Result<StoredAnomaly> {
             AnomalyKind::parse(&kind)
                 .ok_or_else(|| StorageError::Corrupt(format!("anomaly kind {kind:?}")))?
         },
+        resolved_ts_ms: r.get(19)?,
+        last_update_ts_ms: r.get(20)?,
+        system_disk_percent: r.get(21)?,
+        pressure_percent: r.get(22)?,
+        share_percent: r.get(23)?,
+        impact_score: r.get(24)?,
     })
 }
 
@@ -91,9 +122,10 @@ impl Database {
             "INSERT INTO anomaly_events (detected_ts_ms, process_instance_id, pid, process_name, \
              application, exe_path, resource, current_value, baseline_value, deviation_pct, \
              duration_ms, severity, system_cpu_percent, system_memory_percent, \
-             baseline_window_hours, baseline_confidence, explanation, kind) \
+             baseline_window_hours, baseline_confidence, explanation, kind, last_update_ts_ms, \
+             system_disk_percent, pressure_percent, share_percent, impact_score) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18)",
+             ?18, ?1, ?19, ?20, ?21, ?22)",
             params![
                 e.detected_ts_ms,
                 instance_id,
@@ -113,18 +145,88 @@ impl Database {
                 e.baseline_confidence.label(),
                 e.explanation,
                 e.kind.as_str(),
+                e.system.disk_percent,
+                e.impact.pressure_percent,
+                e.impact.share_percent,
+                e.impact.score,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
     }
 
-    /// Events newest first, optionally only those detected at or after `since_ms`.
-    pub fn list_anomalies(&self, since_ms: Option<i64>, limit: u32) -> Result<Vec<StoredAnomaly>> {
+    /// Refresh an active event with newer numbers (it lasted longer, got worse, ...). Who the
+    /// event is about and when it was detected stay as they were.
+    pub fn update_anomaly(&self, id: i64, e: &AnomalyEvent, now_ms: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE anomaly_events SET current_value = ?2, baseline_value = ?3, \
+             deviation_pct = ?4, duration_ms = ?5, severity = ?6, system_cpu_percent = ?7, \
+             system_memory_percent = ?8, system_disk_percent = ?9, pressure_percent = ?10, \
+             share_percent = ?11, impact_score = ?12, explanation = ?13, last_update_ts_ms = ?14 \
+             WHERE id = ?1 AND resolved_ts_ms IS NULL",
+            params![
+                id,
+                e.current,
+                e.baseline,
+                e.deviation_pct,
+                e.duration_ms,
+                e.severity.as_str(),
+                e.system.cpu_percent,
+                e.system.memory_percent,
+                e.system.disk_percent,
+                e.impact.pressure_percent,
+                e.impact.share_percent,
+                e.impact.score,
+                e.explanation,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an event's condition as over. Does nothing if it was already resolved.
+    pub fn resolve_anomaly(&self, id: i64, ts_ms: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE anomaly_events SET resolved_ts_ms = ?2, \
+             last_update_ts_ms = MAX(?2, COALESCE(last_update_ts_ms, 0)) \
+             WHERE id = ?1 AND resolved_ts_ms IS NULL",
+            params![id, ts_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve events left active by a monitor that stopped, as of their last update. Returns how
+    /// many there were.
+    pub fn resolve_stale_anomalies(&self) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE anomaly_events \
+             SET resolved_ts_ms = COALESCE(last_update_ts_ms, detected_ts_ms) \
+             WHERE resolved_ts_ms IS NULL",
+            [],
+        )?)
+    }
+
+    /// Number of events still going on.
+    pub fn active_anomaly_count(&self) -> Result<i64> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM anomaly_events WHERE resolved_ts_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Events, active ones first and then newest first.
+    pub fn list_anomalies(&self, filter: &AnomalyFilter, limit: u32) -> Result<Vec<StoredAnomaly>> {
         let mut stmt = self.conn().prepare(&format!(
-            "SELECT {COLUMNS} FROM anomaly_events WHERE detected_ts_ms >= ?1 \
-             ORDER BY detected_ts_ms DESC, id DESC LIMIT ?2"
+            "SELECT {COLUMNS} FROM anomaly_events \
+             WHERE (resolved_ts_ms IS NULL OR resolved_ts_ms >= ?1) \
+               AND (?2 = 0 OR resolved_ts_ms IS NULL) \
+             ORDER BY resolved_ts_ms IS NULL DESC, detected_ts_ms DESC, id DESC LIMIT ?3"
         ))?;
-        let mut rows = stmt.query(params![since_ms.unwrap_or(i64::MIN), limit])?;
+        let mut rows = stmt.query(params![
+            filter.since_ms.unwrap_or(i64::MIN),
+            i64::from(filter.active_only),
+            limit
+        ])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(from_row(r)?);
@@ -206,7 +308,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winperf_core::anomaly::SystemHealth;
+    use winperf_core::anomaly::{Impact, SystemHealth};
     use winperf_core::profiler::confidence::Confidence;
 
     fn event(ts: i64, pid: u32, severity: Severity) -> AnomalyEvent {
@@ -226,6 +328,12 @@ mod tests {
             system: SystemHealth {
                 cpu_percent: Some(91.0),
                 memory_percent: None,
+                disk_percent: Some(40.0),
+            },
+            impact: Impact {
+                pressure_percent: Some(91.0),
+                share_percent: Some(72.0),
+                score: Some(65.5),
             },
             baseline_window_hours: 24,
             baseline_confidence: Confidence::Established,
@@ -255,6 +363,16 @@ mod tests {
         assert_eq!(back.baseline_window_hours, 24);
         assert_eq!(back.baseline_confidence, "Established");
         assert_eq!(back.explanation, "busy.exe used 72% CPU");
+        assert_eq!(back.system_disk_percent, Some(40.0));
+        assert_eq!(back.pressure_percent, Some(91.0));
+        assert_eq!(back.share_percent, Some(72.0));
+        assert_eq!(back.impact_score, Some(65.5));
+        assert!(back.is_active());
+        assert_eq!(back.resolved_ts_ms, None);
+        assert_eq!(
+            back.last_update_ts_ms, 5_000,
+            "first seen counts as an update"
+        );
         assert_eq!(back.process_instance_id, None, "instance was never stored");
         assert_eq!(db.anomaly(id + 1).unwrap(), None);
     }
@@ -267,13 +385,10 @@ mod tests {
                 .unwrap();
         }
         let pids = |rows: Vec<StoredAnomaly>| rows.iter().map(|r| r.pid).collect::<Vec<_>>();
+        let all = AnomalyFilter::default();
 
-        assert_eq!(pids(db.list_anomalies(None, 10).unwrap()), vec![3, 2, 1]);
-        assert_eq!(
-            pids(db.list_anomalies(Some(2_000), 10).unwrap()),
-            vec![3, 2]
-        );
-        assert_eq!(pids(db.list_anomalies(None, 1).unwrap()), vec![3]);
+        assert_eq!(pids(db.list_anomalies(&all, 10).unwrap()), vec![3, 2, 1]);
+        assert_eq!(pids(db.list_anomalies(&all, 1).unwrap()), vec![3]);
         assert_eq!(db.anomaly_count().unwrap(), 3);
     }
 
@@ -294,6 +409,123 @@ mod tests {
         let back = db.anomaly(id).unwrap().unwrap();
         assert_eq!(back.process_instance_id, Some(9));
         assert_eq!(back.application.as_deref(), Some("Busy Suite"));
+    }
+
+    // ---- lifecycle -----------------------------------------------------------------------
+
+    #[test]
+    fn an_active_event_is_refreshed_in_place_and_keeps_its_identity() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .insert_anomaly(&event(1_000, 7, Severity::Warning))
+            .unwrap();
+
+        let mut worse = event(1_000, 7, Severity::High);
+        worse.current = 90.0;
+        worse.duration_ms = 600_000;
+        worse.impact.score = Some(80.0);
+        worse.explanation = "longer and worse".into();
+        worse.pid = 999; // who it is about never changes
+        db.update_anomaly(id, &worse, 31_000).unwrap();
+
+        let back = db.anomaly(id).unwrap().unwrap();
+        assert_eq!(db.anomaly_count().unwrap(), 1, "updated, not duplicated");
+        assert_eq!(
+            (back.severity, back.current, back.duration_ms),
+            (Severity::High, 90.0, 600_000)
+        );
+        assert_eq!(back.impact_score, Some(80.0));
+        assert_eq!(back.explanation, "longer and worse");
+        assert_eq!(back.last_update_ts_ms, 31_000);
+        assert_eq!(back.detected_ts_ms, 1_000, "detection time is kept");
+        assert_eq!(back.pid, 7);
+        assert!(back.is_active());
+    }
+
+    #[test]
+    fn resolving_ends_an_event_and_freezes_it() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .insert_anomaly(&event(1_000, 7, Severity::Warning))
+            .unwrap();
+        assert_eq!(db.active_anomaly_count().unwrap(), 1);
+
+        db.resolve_anomaly(id, 50_000).unwrap();
+        let back = db.anomaly(id).unwrap().unwrap();
+        assert_eq!(back.resolved_ts_ms, Some(50_000));
+        assert!(!back.is_active());
+        assert_eq!(db.active_anomaly_count().unwrap(), 0);
+
+        // Later updates and resolutions do nothing.
+        let mut other = event(1_000, 7, Severity::Critical);
+        other.current = 1.0;
+        db.update_anomaly(id, &other, 60_000).unwrap();
+        db.resolve_anomaly(id, 70_000).unwrap();
+        let back = db.anomaly(id).unwrap().unwrap();
+        assert_eq!((back.severity, back.current), (Severity::Warning, 72.0));
+        assert_eq!(back.resolved_ts_ms, Some(50_000));
+    }
+
+    #[test]
+    fn events_left_active_by_a_stopped_monitor_are_resolved_as_of_their_last_update() {
+        let db = Database::open_in_memory().unwrap();
+        let a = db
+            .insert_anomaly(&event(1_000, 1, Severity::Warning))
+            .unwrap();
+        db.update_anomaly(a, &event(1_000, 1, Severity::Warning), 9_000)
+            .unwrap();
+        let b = db
+            .insert_anomaly(&event(2_000, 2, Severity::Warning))
+            .unwrap();
+        db.resolve_anomaly(b, 3_000).unwrap();
+
+        assert_eq!(
+            db.resolve_stale_anomalies().unwrap(),
+            1,
+            "only the active one"
+        );
+        assert_eq!(db.anomaly(a).unwrap().unwrap().resolved_ts_ms, Some(9_000));
+        assert_eq!(db.anomaly(b).unwrap().unwrap().resolved_ts_ms, Some(3_000));
+        assert_eq!(db.resolve_stale_anomalies().unwrap(), 0);
+    }
+
+    #[test]
+    fn listing_puts_active_events_first_and_can_show_only_them() {
+        let db = Database::open_in_memory().unwrap();
+        let old = db
+            .insert_anomaly(&event(1_000, 1, Severity::Warning))
+            .unwrap();
+        db.resolve_anomaly(old, 5_000).unwrap();
+        db.insert_anomaly(&event(2_000, 2, Severity::Warning))
+            .unwrap(); // active, older start
+        let newer = db
+            .insert_anomaly(&event(3_000, 3, Severity::Warning))
+            .unwrap();
+        db.resolve_anomaly(newer, 4_000).unwrap();
+        let pids = |f: &AnomalyFilter| {
+            db.list_anomalies(f, 10)
+                .unwrap()
+                .iter()
+                .map(|r| r.pid)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            pids(&AnomalyFilter::default()),
+            vec![2, 3, 1],
+            "active first, then newest"
+        );
+        let active = AnomalyFilter {
+            active_only: true,
+            ..Default::default()
+        };
+        assert_eq!(pids(&active), vec![2]);
+        // `since` keeps what was active at or after that time: still going, or resolved since.
+        let since = AnomalyFilter {
+            since_ms: Some(4_500),
+            ..Default::default()
+        };
+        assert_eq!(pids(&since), vec![2, 1]);
     }
 
     // ---- usable baselines ----------------------------------------------------------------

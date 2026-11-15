@@ -7,7 +7,7 @@ pub mod lifecycle;
 pub mod profile;
 pub mod samples;
 
-pub use anomalies::StoredAnomaly;
+pub use anomalies::{AnomalyFilter, StoredAnomaly};
 pub use baselines::{ListedBaseline, RecomputeReport, StoredBaseline};
 pub use inventory::FileIdentity;
 pub use profile::ProfileState;

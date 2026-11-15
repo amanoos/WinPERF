@@ -9,10 +9,10 @@
 //! garbage collection)? Only when all three say yes does it fire, once per episode. The wording is
 //! always "potential": growth alone cannot prove a leak.
 
-use super::BaselineStats;
 use super::format::{bytes, window_label};
 use super::level::sensitivity_word;
 use super::rules::LeakRule;
+use super::{BaselineStats, Phase};
 use crate::ProcessKey;
 use crate::profiler::stats::growth_rate;
 use crate::time::format_span;
@@ -33,6 +33,7 @@ pub struct LeakReading<'a> {
 /// An instance that looks like it is leaking.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeakDetection {
+    pub phase: Phase,
     pub ts_ms: i64,
     pub key: ProcessKey,
     pub name: String,
@@ -57,7 +58,8 @@ pub struct LeakDetection {
 struct Track {
     /// (time ms, private bytes), one point per `point_every_ms`, covering about the window.
     points: VecDeque<(i64, f64)>,
-    fired: bool,
+    /// The latest detection, while the episode counts as a potential leak.
+    fired: Option<LeakDetection>,
     last_tick: u64,
 }
 
@@ -87,22 +89,29 @@ impl LeakDetector {
         &self.rule
     }
 
-    /// Forget every history (detection was paused).
-    pub fn reset(&mut self) {
-        self.tracks.clear();
+    /// Forget every history (detection was paused). Potential leaks that were active end.
+    pub fn reset(&mut self) -> Vec<LeakDetection> {
+        self.tracks
+            .drain()
+            .filter_map(|(_, t)| t.fired.map(ended))
+            .collect()
     }
 
     /// Feed one tick. Only instances whose subject has a usable memory baseline belong in
     /// `readings`; an instance that is absent loses its history.
+    ///
+    /// Returns `Started` once per episode, `Ongoing` each time a history point confirms it still
+    /// holds (every `point_every_ms`), and `Ended` when memory is given back, growth levels off,
+    /// or the instance is gone.
     pub fn observe_tick(&mut self, ts_ms: i64, readings: &[LeakReading<'_>]) -> Vec<LeakDetection> {
         self.tick += 1;
         let tick = self.tick;
-        let mut raised = Vec::new();
+        let mut out = Vec::new();
 
         for r in readings {
             let track = self.tracks.entry(r.key).or_insert_with(|| Track {
                 points: VecDeque::new(),
-                fired: false,
+                fired: None,
                 last_tick: tick,
             });
             track.last_tick = tick;
@@ -120,9 +129,13 @@ impl LeakDetector {
             }
             let usual = r.baseline.growth_per_hour.unwrap_or(0.0).max(0.0);
             match assess(&track.points, &self.rule, usual) {
-                Some(v) if !track.fired => {
-                    track.fired = true;
-                    raised.push(LeakDetection {
+                Some(v) => {
+                    let d = LeakDetection {
+                        phase: if track.fired.is_some() {
+                            Phase::Ongoing
+                        } else {
+                            Phase::Started
+                        },
                         ts_ms,
                         key: r.key,
                         name: r.name.to_string(),
@@ -136,16 +149,34 @@ impl LeakDetector {
                         reclaimed_fraction: v.reclaimed_fraction,
                         baseline: r.baseline.clone(),
                         rule: self.rule,
-                    });
+                    };
+                    track.fired = Some(d.clone());
+                    out.push(d);
                 }
-                Some(_) => {}
-                None => track.fired = false, // reclaimed or levelled off: the episode is over
+                None => {
+                    // Reclaimed or levelled off: the episode is over.
+                    if let Some(d) = track.fired.take() {
+                        out.push(ended(d));
+                    }
+                }
             }
         }
 
-        self.tracks.retain(|_, t| t.last_tick == tick);
-        raised
+        self.tracks.retain(|_, t| {
+            let keep = t.last_tick == tick;
+            if !keep && let Some(d) = t.fired.take() {
+                out.push(ended(d));
+            }
+            keep
+        });
+        out
     }
+}
+
+/// The last detection of an episode, marked as over.
+fn ended(mut d: LeakDetection) -> LeakDetection {
+    d.phase = Phase::Ended;
+    d
 }
 
 /// Judge one window of history. `None` unless it covers the whole window and passes all tests.
@@ -255,7 +286,9 @@ mod tests {
                 exe_path: r"C:\apps\leaky.exe",
                 baseline: b,
             };
-            if !det.observe_tick(i as i64 * TICK_MS, &[r]).is_empty() {
+            if (det.observe_tick(i as i64 * TICK_MS, &[r]).iter())
+                .any(|d| d.phase == Phase::Started)
+            {
                 fired.push(i);
             }
         }
@@ -361,7 +394,9 @@ mod tests {
                     i as i64 * TICK_MS,
                     &[at(200.0 * MIB + 3.0 * MIB * minutes(i))],
                 )
-                .len();
+                .iter()
+                .filter(|d| d.phase == Phase::Started)
+                .count();
         }
         assert_eq!(fired, 0, "only 16 minutes of fresh history");
     }
@@ -390,8 +425,10 @@ mod tests {
                 exe_path: "p",
                 baseline: &b,
             };
-            if let Some(d) = det.observe_tick(i as i64 * TICK_MS, &[r]).pop() {
-                found = Some(d);
+            for d in det.observe_tick(i as i64 * TICK_MS, &[r]) {
+                if d.phase == Phase::Started {
+                    found = Some(d);
+                }
             }
         }
         let d = found.expect("a ramp is detected");
@@ -411,5 +448,74 @@ mod tests {
             "{}",
             d.rate_per_hour
         );
+    }
+
+    // ---- lifecycle -----------------------------------------------------------------------
+
+    fn phases(
+        det: &mut LeakDetector,
+        b: &BaselineStats,
+        bytes_at: impl Fn(usize) -> f64,
+        ticks: usize,
+    ) -> Vec<Phase> {
+        let key = ProcessKey::new(7, 1);
+        let mut out = Vec::new();
+        for i in 0..ticks {
+            let r = LeakReading {
+                key,
+                private_bytes: bytes_at(i),
+                name: "leaky.exe",
+                exe_path: "p",
+                baseline: b,
+            };
+            out.extend(
+                det.observe_tick(i as i64 * TICK_MS, &[r])
+                    .into_iter()
+                    .map(|d| d.phase),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn a_leak_continues_while_it_holds_and_ends_when_memory_is_reclaimed() {
+        let b = baseline(Some(0.0));
+        // Ramp for 40 minutes, then everything is given back.
+        let f = |i: usize| {
+            if minutes(i) < 40.0 {
+                200.0 * MIB + 3.0 * MIB * minutes(i)
+            } else {
+                200.0 * MIB
+            }
+        };
+        let p = phases(&mut detector(), &b, f, 520);
+        assert_eq!(p.iter().filter(|x| **x == Phase::Started).count(), 1);
+        assert!(
+            p.iter().filter(|x| **x == Phase::Ongoing).count() >= 10,
+            "{p:?}"
+        );
+        assert_eq!(p.iter().filter(|x| **x == Phase::Ended).count(), 1);
+        assert_eq!(p.last(), Some(&Phase::Ended));
+    }
+
+    #[test]
+    fn a_leaking_process_that_exits_ends_its_event() {
+        let b = baseline(Some(0.0));
+        let mut det = detector();
+        let key = ProcessKey::new(7, 1);
+        for i in 0..400 {
+            let r = LeakReading {
+                key,
+                private_bytes: 200.0 * MIB + 3.0 * MIB * minutes(i),
+                name: "leaky.exe",
+                exe_path: "p",
+                baseline: &b,
+            };
+            det.observe_tick(i as i64 * TICK_MS, &[r]);
+        }
+        let gone = det.observe_tick(400 * TICK_MS, &[]);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].phase, Phase::Ended);
+        assert!(det.reset().is_empty());
     }
 }

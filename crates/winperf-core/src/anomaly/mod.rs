@@ -10,7 +10,10 @@ pub mod format;
 pub mod leak;
 pub mod level;
 pub mod rules;
+pub mod severity;
 pub mod tracker;
+
+pub use severity::Impact;
 
 use crate::config::{DetectionConfig, Resource, Sensitivity};
 use crate::profiler::baseline::BaselineMetric;
@@ -195,6 +198,8 @@ pub struct SystemHealth {
     pub cpu_percent: Option<f64>,
     /// Physical memory in use, percent.
     pub memory_percent: Option<f64>,
+    /// Busiest disk, percent of time busy.
+    pub disk_percent: Option<f64>,
 }
 
 /// One detected anomaly (FR-018).
@@ -220,7 +225,32 @@ pub struct AnomalyEvent {
     pub duration_ms: i64,
     pub severity: Severity,
     pub system: SystemHealth,
+    /// How much this weighs on the system (FR-017).
+    pub impact: Impact,
     pub baseline_window_hours: u32,
     pub baseline_confidence: Confidence,
     pub explanation: String,
+}
+
+/// Where a detector's episode stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The behaviour has just lasted long enough to count.
+    Started,
+    /// It is still going on.
+    Ongoing,
+    /// It has stopped (or can no longer be judged).
+    Ended,
+}
+
+/// What happened to an anomaly this tick. `key` identifies the condition (a process and a
+/// resource), so a condition that goes on updates one event instead of raising a new one each time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnomalyChange {
+    /// A new event.
+    Raised { key: String, event: AnomalyEvent },
+    /// The event for `key` has new numbers (it lasted longer, got worse, ...).
+    Updated { key: String, event: AnomalyEvent },
+    /// The condition ended at `ts_ms`.
+    Resolved { key: String, ts_ms: i64 },
 }

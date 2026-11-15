@@ -4,7 +4,7 @@ use std::io::Write;
 use winperf_core::anomaly::{AnomalyKind, format};
 use winperf_core::config::Resource;
 use winperf_core::time::{format_span, unix_millis_to_utc_string};
-use winperf_storage::{Database, StoredAnomaly};
+use winperf_storage::{AnomalyFilter, Database, StoredAnomaly};
 
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -30,27 +30,48 @@ fn deviation(pct: f64) -> String {
     format!("{pct:+.0}%")
 }
 
-/// A one-line summary per event, newest first. `hours` limits how far back to look.
+/// A one-line summary per event, active ones first and then newest first. `hours` limits how far
+/// back to look (events that were active in that time), `active_only` shows only the ones still
+/// going on.
 pub fn list(
     db: &Database,
     hours: Option<u32>,
+    active_only: bool,
     limit: u32,
     now_ms: i64,
     out: &mut impl Write,
 ) -> Result {
-    let since = hours.map(|h| now_ms - i64::from(h) * MS_PER_HOUR);
-    let rows = db.list_anomalies(since, limit)?;
+    let filter = AnomalyFilter {
+        since_ms: hours.map(|h| now_ms - i64::from(h) * MS_PER_HOUR),
+        active_only,
+    };
+    let rows = db.list_anomalies(&filter, limit)?;
     if rows.is_empty() {
+        let what = if active_only {
+            "active anomalies"
+        } else {
+            "anomalies"
+        };
         match hours {
-            Some(h) => writeln!(out, "no anomalies in the last {h} h")?,
+            Some(h) => writeln!(out, "no {what} in the last {h} h")?,
+            None if active_only => writeln!(out, "no active anomalies")?,
             None => writeln!(out, "no anomalies recorded")?,
         }
         return Ok(());
     }
     writeln!(
         out,
-        "{:<5} {:<19} {:<13} {:<10} {:<28} {:>10} {:>10} {:>7} {:>8}",
-        "ID", "TIME (UTC)", "SEVERITY", "RESOURCE", "PROCESS", "NOW", "NORMAL", "OVER", "LASTED"
+        "{:<5} {:<19} {:<13} {:<9} {:<10} {:<28} {:>10} {:>10} {:>7} {:>8}",
+        "ID",
+        "TIME (UTC)",
+        "SEVERITY",
+        "STATE",
+        "RESOURCE",
+        "PROCESS",
+        "NOW",
+        "NORMAL",
+        "OVER",
+        "LASTED"
     )?;
     for a in &rows {
         writeln!(out, "{}", format_row(a))?;
@@ -72,10 +93,11 @@ fn format_row(a: &StoredAnomaly) -> String {
         process
     };
     format!(
-        "{:<5} {:<19} {:<13} {:<10} {:<28} {:>10} {:>10} {:>7} {:>8}",
+        "{:<5} {:<19} {:<13} {:<9} {:<10} {:<28} {:>10} {:>10} {:>7} {:>8}",
         a.id,
         at(a.detected_ts_ms),
         a.severity.label(),
+        if a.is_active() { "active" } else { "resolved" },
         what(a),
         process,
         value(a, a.current),
@@ -92,6 +114,14 @@ pub fn show(db: &Database, id: i64, out: &mut impl Write) -> Result {
     };
     writeln!(out, "Anomaly #{} - {}", a.id, a.severity.label())?;
     writeln!(out, "  Detected     {} UTC", at(a.detected_ts_ms))?;
+    match a.resolved_ts_ms {
+        None => writeln!(
+            out,
+            "  State        active (last confirmed {} UTC)",
+            at(a.last_update_ts_ms)
+        )?,
+        Some(t) => writeln!(out, "  State        resolved at {} UTC", at(t))?,
+    }
     writeln!(out, "  Process      {} (PID {})", a.process_name, a.pid)?;
     if let Some(app) = &a.application {
         writeln!(out, "  Application  {app}")?;
@@ -112,15 +142,31 @@ pub fn show(db: &Database, id: i64, out: &mut impl Write) -> Result {
     )?;
     writeln!(out, "  Deviation    {}", deviation(a.deviation_pct))?;
     writeln!(out, "  Duration     {}", format_span(a.duration_ms))?;
-    let system = match (a.system_cpu_percent, a.system_memory_percent) {
-        (None, None) => "not measured".to_string(),
-        (cpu, mem) => format!(
-            "CPU {}, memory {}",
+    let system = match (
+        a.system_cpu_percent,
+        a.system_memory_percent,
+        a.system_disk_percent,
+    ) {
+        (None, None, None) => "not measured".to_string(),
+        (cpu, mem, disk) => format!(
+            "CPU {}, memory {}, disk {}",
             cpu.map_or("n/a".into(), |v| format!("{v:.1}%")),
             mem.map_or("n/a".into(), |v| format!("{v:.1}% in use")),
+            disk.map_or("n/a".into(), |v| format!("{v:.1}% busy")),
         ),
     };
     writeln!(out, "  System       {system}")?;
+    let part = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{v:.0}%"));
+    writeln!(
+        out,
+        "  Impact       {} (system pressure {}, process share {})",
+        a.impact_score
+            .map_or("not measured".to_string(), |v| format!(
+                "score {v:.0} of 100"
+            )),
+        part(a.pressure_percent),
+        part(a.share_percent),
+    )?;
     writeln!(out, "  Why          {}", a.explanation)?;
     Ok(())
 }
@@ -128,7 +174,7 @@ pub fn show(db: &Database, id: i64, out: &mut impl Write) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winperf_core::anomaly::{AnomalyEvent, Severity, SystemHealth};
+    use winperf_core::anomaly::{AnomalyEvent, Impact, Severity, SystemHealth};
     use winperf_core::profiler::confidence::Confidence;
 
     fn seed(db: &Database, ts: i64, name: &str) -> i64 {
@@ -148,6 +194,12 @@ mod tests {
             system: SystemHealth {
                 cpu_percent: Some(91.0),
                 memory_percent: Some(75.0),
+                disk_percent: None,
+            },
+            impact: Impact {
+                pressure_percent: Some(91.0),
+                share_percent: Some(72.0),
+                score: Some(65.5),
             },
             baseline_window_hours: 24,
             baseline_confidence: Confidence::Established,
@@ -166,7 +218,7 @@ mod tests {
     fn the_list_shows_one_readable_line_per_event() {
         let db = Database::open_in_memory().unwrap();
         let id = seed(&db, 1_700_000_000_000, "busy.exe");
-        let t = text(|o| list(&db, None, 50, 1_700_000_100_000, o));
+        let t = text(|o| list(&db, None, false, 50, 1_700_000_100_000, o));
 
         assert!(t.contains("SEVERITY") && t.contains("LASTED"), "{t}");
         for expected in [
@@ -189,11 +241,11 @@ mod tests {
     fn an_empty_list_says_so_and_names_the_time_range() {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(
-            text(|o| list(&db, None, 50, 0, o)).trim(),
+            text(|o| list(&db, None, false, 50, 0, o)).trim(),
             "no anomalies recorded"
         );
         assert_eq!(
-            text(|o| list(&db, Some(6), 50, 0, o)).trim(),
+            text(|o| list(&db, Some(6), false, 50, 0, o)).trim(),
             "no anomalies in the last 6 h"
         );
     }
@@ -203,8 +255,9 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let now = 10 * MS_PER_HOUR;
         seed(&db, now - 30 * 60_000, "recent.exe");
-        seed(&db, now - 5 * MS_PER_HOUR, "older.exe");
-        let t = text(|o| list(&db, Some(1), 50, now, o));
+        let older = seed(&db, now - 5 * MS_PER_HOUR, "older.exe");
+        db.resolve_anomaly(older, now - 4 * MS_PER_HOUR).unwrap();
+        let t = text(|o| list(&db, Some(1), false, 50, now, o));
         assert!(t.contains("recent.exe") && !t.contains("older.exe"), "{t}");
     }
 
@@ -212,7 +265,7 @@ mod tests {
     fn a_very_long_process_name_is_cut_to_keep_the_columns() {
         let db = Database::open_in_memory().unwrap();
         seed(&db, 1, &"x".repeat(60));
-        let t = text(|o| list(&db, None, 50, 2, o));
+        let t = text(|o| list(&db, None, false, 50, 2, o));
         let mut lines = t.lines();
         let header = lines.next().unwrap();
         let line = lines.next().unwrap();
@@ -234,7 +287,9 @@ mod tests {
             "8.0% (median; 24 h window, Established confidence)",
             "+800%",
             "2m 05s",
-            "CPU 91.0%, memory 75.0% in use",
+            "CPU 91.0%, memory 75.0% in use, disk n/a",
+            "score 66 of 100 (system pressure 91%, process share 72%)",
+            "State        active",
             "busy.exe was busy",
         ] {
             assert!(t.contains(expected), "missing {expected:?} in\n{t}");
@@ -246,6 +301,55 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let err = show(&db, 99, &mut Vec::new()).unwrap_err();
         assert_eq!(err.to_string(), "no anomaly with id 99");
+    }
+
+    #[test]
+    fn the_list_shows_state_and_can_be_limited_to_active_events() {
+        let db = Database::open_in_memory().unwrap();
+        let done = seed(&db, 1_000, "done.exe");
+        seed(&db, 2_000, "going.exe");
+        db.resolve_anomaly(done, 5_000).unwrap();
+
+        let all = text(|o| list(&db, None, false, 50, 10_000, o));
+        assert!(
+            all.contains("STATE") && all.contains("resolved") && all.contains("active"),
+            "{all}"
+        );
+        let going = all.find("going.exe").unwrap();
+        assert!(
+            going < all.find("done.exe").unwrap(),
+            "active first:
+{all}"
+        );
+
+        let active = text(|o| list(&db, None, true, 50, 10_000, o));
+        assert!(
+            active.contains("going.exe") && !active.contains("done.exe"),
+            "{active}"
+        );
+        db.resolve_anomaly(2, 6_000).unwrap();
+        assert_eq!(
+            text(|o| list(&db, None, true, 50, 10_000, o)).trim(),
+            "no active anomalies"
+        );
+    }
+
+    #[test]
+    fn show_says_whether_the_event_is_going_on_and_what_it_weighs() {
+        let db = Database::open_in_memory().unwrap();
+        let id = seed(&db, 1_700_000_000_000, "busy.exe");
+        let t = text(|o| show(&db, id, o));
+        assert!(
+            t.contains("State        active (last confirmed 2023-11-14 22:13:20 UTC)"),
+            "{t}"
+        );
+        db.resolve_anomaly(id, 1_700_000_600_000).unwrap();
+        let t = text(|o| show(&db, id, o));
+        assert!(
+            t.contains("State        resolved at 2023-11-14 22:23:20 UTC"),
+            "{t}"
+        );
+        assert!(t.contains("Impact       score 66 of 100"), "{t}");
     }
 
     #[test]
@@ -266,12 +370,13 @@ mod tests {
             duration_ms: 1_800_000,
             severity: Severity::Warning,
             system: SystemHealth::default(),
+            impact: Impact::default(),
             baseline_window_hours: 24,
             baseline_confidence: Confidence::Established,
             explanation: "Potential memory leak: leaky.exe".into(),
         })
         .unwrap();
-        let t = text(|o| list(&db, None, 50, 1_700_000_100_000, o));
+        let t = text(|o| list(&db, None, false, 50, 1_700_000_100_000, o));
         assert!(t.contains("mem-growth") && t.contains("180.0 MiB/h"), "{t}");
         let t = text(|o| show(&db, 1, o));
         assert!(t.contains("Resource     mem-growth"), "{t}");

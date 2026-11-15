@@ -5,15 +5,20 @@
 //! baselines or write an event is remembered (see [`DetectingSink::last_error`]) instead of
 //! stopping the monitor.
 //!
+//! Each anomaly lives in one row: the first sighting inserts it, later updates refresh it in place,
+//! and when the condition ends the row is resolved. Rows a stopped monitor left active are resolved
+//! (as of their last update) when the next monitor starts.
+//!
 //! Baselines are re-read every [`DetectSettings::refresh`] (they change only when the baseline
 //! job runs), together with the profiling-mode marker: while profiling is active nothing is raised.
 
 use crate::db::Database;
 use crate::error::StorageError;
 use crate::sink::DbSink;
+use std::collections::HashMap;
 use std::time::Duration;
-use winperf_core::anomaly::Sensitivities;
 use winperf_core::anomaly::tracker::AnomalyTracker;
+use winperf_core::anomaly::{AnomalyChange, Sensitivities};
 use winperf_core::config::ConfidenceConfig;
 use winperf_core::engine::{SampleSink, TickBatch};
 
@@ -51,19 +56,27 @@ pub struct DetectingSink {
     last_refresh_ms: Option<i64>,
     raised: u64,
     last_error: Option<String>,
+    /// The database row of each active anomaly, by the tracker's key for it.
+    rows: HashMap<String, i64>,
 }
 
 impl DetectingSink {
     pub fn new(inner: DbSink, settings: DetectSettings) -> Self {
         let tracker = AnomalyTracker::new(settings.sensitivities);
-        Self {
+        let mut sink = Self {
             inner,
             tracker,
             settings,
             last_refresh_ms: None,
             raised: 0,
             last_error: None,
+            rows: HashMap::new(),
+        };
+        // Anything still marked active belongs to a monitor that is no longer running.
+        if let Err(e) = sink.inner.database().resolve_stale_anomalies() {
+            sink.last_error = Some(format!("closing earlier anomalies: {e}"));
         }
+        sink
     }
 
     /// Anomalies raised and stored so far.
@@ -98,13 +111,19 @@ impl DetectingSink {
             return;
         }
         self.last_refresh_ms = Some(now_ms);
-        let db = self.inner.database();
         // On failure keep what we had: a database that is briefly busy must not blind detection.
-        match db.profile_state() {
-            Ok(state) => self.tracker.set_enabled(!state.active),
+        match self.inner.database().profile_state() {
+            Ok(state) => {
+                let changes = self.tracker.set_enabled(!state.active);
+                self.store(changes, now_ms);
+            }
             Err(e) => self.last_error = Some(format!("reading profiling state: {e}")),
         }
-        match db.usable_baselines(&self.settings.windows_hours, &self.settings.confidence) {
+        match self
+            .inner
+            .database()
+            .usable_baselines(&self.settings.windows_hours, &self.settings.confidence)
+        {
             Ok(baselines) => self.tracker.set_baselines(baselines),
             Err(e) => self.last_error = Some(format!("reading baselines: {e}")),
         }
@@ -112,10 +131,30 @@ impl DetectingSink {
 
     fn detect(&mut self, batch: &TickBatch) {
         self.refresh_if_due(batch.ts_ms);
-        for event in self.tracker.ingest(batch) {
-            match self.inner.database().insert_anomaly(&event) {
-                Ok(_) => self.raised += 1,
-                Err(e) => self.last_error = Some(format!("storing an anomaly: {e}")),
+        let changes = self.tracker.ingest(batch);
+        self.store(changes, batch.ts_ms);
+    }
+
+    /// Write what changed: new events are inserted, active ones refreshed, finished ones resolved.
+    fn store(&mut self, changes: Vec<AnomalyChange>, now_ms: i64) {
+        let db = self.inner.database();
+        for change in changes {
+            let result = match change {
+                AnomalyChange::Raised { key, event } => db.insert_anomaly(&event).map(|id| {
+                    self.rows.insert(key, id);
+                    self.raised += 1;
+                }),
+                AnomalyChange::Updated { key, event } => match self.rows.get(&key) {
+                    Some(id) => db.update_anomaly(*id, &event, now_ms),
+                    None => Ok(()),
+                },
+                AnomalyChange::Resolved { key, ts_ms } => match self.rows.remove(&key) {
+                    Some(id) => db.resolve_anomaly(id, ts_ms),
+                    None => Ok(()),
+                },
+            };
+            if let Err(e) = result {
+                self.last_error = Some(format!("storing an anomaly: {e}"));
             }
         }
     }
@@ -138,6 +177,7 @@ impl SampleSink for DetectingSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::AnomalyFilter;
     use rusqlite::params;
     use std::collections::VecDeque;
     use winperf_core::config::Sensitivity;
@@ -231,14 +271,26 @@ mod tests {
 
         assert_eq!(sink.raised(), 1);
         assert_eq!(sink.last_error(), None);
-        let events = sink.database().list_anomalies(None, 10).unwrap();
+        let events = sink
+            .database()
+            .list_anomalies(&AnomalyFilter::default(), 10)
+            .unwrap();
         assert_eq!(events.len(), 1);
         let e = &events[0];
         assert_eq!((e.process_name.as_str(), e.pid), ("busy.exe", 7));
         assert_eq!(e.exe_path, PATH);
         assert_eq!(e.current, 72.0);
         assert_eq!(e.baseline, 8.0);
-        assert_eq!(e.duration_ms, 120_000);
+        assert_eq!(
+            e.detected_ts_ms, 125_000,
+            "raised once it had lasted 2 minutes"
+        );
+        assert!(
+            e.duration_ms > 120_000,
+            "refreshed as it went on: {}",
+            e.duration_ms
+        );
+        assert!(e.is_active());
         assert_eq!(e.baseline_window_hours, 24);
         assert!(
             e.process_instance_id.is_some(),
@@ -285,6 +337,96 @@ mod tests {
         assert_eq!(sink.database().sample_count().unwrap(), 10);
     }
 
+    /// 72% for `burn` ticks, then idle for the rest of `ticks`.
+    fn burn_then_idle(burn: u64, ticks: u64) -> Script {
+        Script(
+            (0..ticks)
+                .map(|i| {
+                    let busy = i.min(burn);
+                    let idle = i.saturating_sub(burn);
+                    vec![Observation {
+                        pid: 7,
+                        name: "busy.exe".into(),
+                        start_time: Some(100),
+                        cpu_time_100ns: Some(busy * 72 * ONE_PERCENT_PER_TICK + idle),
+                        working_set: Some(1),
+                        ..Default::default()
+                    }]
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn one_row_follows_an_anomaly_from_raised_to_resolved() {
+        let db = database_with_baseline(5_000, 600);
+        let sink = run(db, burn_then_idle(40, 60), 60);
+
+        let events = sink
+            .database()
+            .list_anomalies(&AnomalyFilter::default(), 10)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one row for the whole episode: {events:#?}"
+        );
+        let e = &events[0];
+        assert!(!e.is_active(), "the burn ended");
+        assert!(e.resolved_ts_ms.is_some());
+        assert!(e.duration_ms >= 150_000, "{}", e.duration_ms);
+        assert!(e.last_update_ts_ms >= e.detected_ts_ms);
+        assert_eq!(sink.database().active_anomaly_count().unwrap(), 0);
+        assert_eq!(sink.raised(), 1);
+    }
+
+    #[test]
+    fn a_new_monitor_closes_what_a_stopped_one_left_active() {
+        let db = database_with_baseline(5_000, 600);
+        let sink = run(db, burner(40, 72), 40); // stops while the burn is still on
+        assert_eq!(sink.database().active_anomaly_count().unwrap(), 1);
+
+        let db = sink.into_database();
+        let sink = run(db, burner(2, 1), 2); // the next monitor starts
+        assert_eq!(sink.database().active_anomaly_count().unwrap(), 0);
+        let e = &sink
+            .database()
+            .list_anomalies(&AnomalyFilter::default(), 10)
+            .unwrap()[0];
+        assert_eq!(e.resolved_ts_ms, Some(e.last_update_ts_ms));
+    }
+
+    #[test]
+    fn profiling_mode_resolves_an_anomaly_that_was_active() {
+        let db = database_with_baseline(5_000, 600);
+        let settings = DetectSettings {
+            refresh: Duration::from_secs(60),
+            ..DetectSettings::new(
+                Sensitivities::uniform(Sensitivity::Normal),
+                vec![1, 24, 168],
+                ConfidenceConfig::default(),
+            )
+        };
+        let mut engine = Engine::new(
+            burner(60, 72),
+            DetectingSink::new(DbSink::new(db), settings),
+        );
+        for i in 0..60i64 {
+            if i == 40 {
+                engine.sink().database().start_profiling(1).unwrap();
+            }
+            engine
+                .tick_with_elapsed(i * 5_000, Duration::from_secs(5))
+                .unwrap();
+        }
+        let sink = engine.into_parts().1;
+        let e = &sink
+            .database()
+            .list_anomalies(&AnomalyFilter::default(), 10)
+            .unwrap()[0];
+        assert!(!e.is_active(), "learning again: nothing is judged any more");
+    }
+
     /// A process whose private memory climbs 3 MiB a minute for 40 minutes (5 s ticks).
     fn leaker() -> Script {
         Script(
@@ -315,7 +457,10 @@ mod tests {
             .unwrap();
         let sink = run(db, leaker(), 480);
 
-        let events = sink.database().list_anomalies(None, 10).unwrap();
+        let events = sink
+            .database()
+            .list_anomalies(&AnomalyFilter::default(), 10)
+            .unwrap();
         assert_eq!(events.len(), 1, "{events:#?}");
         let e = &events[0];
         assert_eq!(e.kind, winperf_core::anomaly::AnomalyKind::MemoryGrowth);

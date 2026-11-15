@@ -6,7 +6,7 @@
 
 use super::format::{value, window_label};
 use super::rules::LevelRule;
-use super::{AnomalyKind, BaselineStats, resource_of};
+use super::{AnomalyKind, BaselineStats, Phase, resource_of};
 use crate::ProcessKey;
 use crate::config::Sensitivity;
 use crate::profiler::baseline::BaselineMetric;
@@ -25,16 +25,20 @@ pub struct Reading<'a> {
     pub exe_path: &'a str,
 }
 
-/// A subject that has been abnormal long enough.
+/// A subject that has been abnormal long enough, as of one tick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
+    pub phase: Phase,
     pub ts_ms: i64,
+    /// The subject's identity (the lower-cased executable path).
+    pub subject: String,
     pub name: String,
     pub exe_path: String,
     pub top: ProcessKey,
-    /// Mean level over the abnormal stretch.
+    /// Mean level over the abnormal stretch so far.
     pub current: f64,
     pub peak: f64,
+    /// How long the stretch has lasted (up to `ts_ms`).
     pub duration_ms: i64,
     /// The line it had to stay above.
     pub threshold: f64,
@@ -49,7 +53,8 @@ struct Episode {
     peak: f64,
     /// Consecutive readings below the line.
     dips: u32,
-    fired: bool,
+    /// The latest detection, once the episode has counted as an anomaly.
+    fired: Option<Detection>,
     last_tick: u64,
 }
 
@@ -72,13 +77,19 @@ impl LevelDetector {
         &self.rule
     }
 
-    /// Forget every episode in progress (detection was paused).
-    pub fn reset(&mut self) {
-        self.episodes.clear();
+    /// Forget every episode in progress (detection was paused). Anomalies that were active end.
+    pub fn reset(&mut self) -> Vec<Detection> {
+        self.episodes
+            .drain()
+            .filter_map(|(_, ep)| ep.fired.map(ended))
+            .collect()
     }
 
     /// Feed one tick. `baselines` holds only usable baselines, by subject: a subject without one
     /// is never judged. A subject missing from `readings` counts as quiet for this tick.
+    ///
+    /// Returns `Started` once per episode when it has lasted long enough, `Ongoing` on every later
+    /// tick it continues, and `Ended` when it is over.
     pub fn observe_tick(
         &mut self,
         ts_ms: i64,
@@ -87,11 +98,15 @@ impl LevelDetector {
     ) -> Vec<Detection> {
         self.tick += 1;
         let tick = self.tick;
-        let mut raised = Vec::new();
+        let mut out = Vec::new();
 
         for r in readings {
             let Some(baseline) = baselines.get(r.subject) else {
-                self.episodes.remove(r.subject);
+                if let Some(ep) = self.episodes.remove(r.subject)
+                    && let Some(d) = ep.fired
+                {
+                    out.push(ended(d));
+                }
                 continue;
             };
             let threshold = self.rule.threshold(baseline);
@@ -105,7 +120,7 @@ impl LevelDetector {
                         count: 0,
                         peak: 0.0,
                         dips: 0,
-                        fired: false,
+                        fired: None,
                         last_tick: tick,
                     });
                 ep.dips = 0;
@@ -114,10 +129,16 @@ impl LevelDetector {
                 ep.count += 1;
                 ep.peak = ep.peak.max(r.value);
                 let lasted = ts_ms - ep.first_ts_ms;
-                if !ep.fired && lasted >= self.rule.sustain_ms {
-                    ep.fired = true;
-                    raised.push(Detection {
+                if ep.fired.is_some() || lasted >= self.rule.sustain_ms {
+                    let phase = if ep.fired.is_some() {
+                        Phase::Ongoing
+                    } else {
+                        Phase::Started
+                    };
+                    let d = Detection {
+                        phase,
                         ts_ms,
+                        subject: r.subject.to_string(),
                         name: r.name.to_string(),
                         exe_path: r.exe_path.to_string(),
                         top: r.top,
@@ -127,7 +148,9 @@ impl LevelDetector {
                         threshold,
                         baseline: baseline.clone(),
                         rule: self.rule,
-                    });
+                    };
+                    ep.fired = Some(d.clone());
+                    out.push(d);
                 }
             } else if let Some(ep) = self.episodes.get_mut(r.subject) {
                 ep.dips += 1;
@@ -137,14 +160,26 @@ impl LevelDetector {
 
         // Subjects that were not seen at all this tick (their processes ended) were quiet too.
         let tolerated = self.rule.tolerated_dips;
+        let mut over = Vec::new();
         self.episodes.retain(|_, ep| {
             if ep.last_tick != tick {
                 ep.dips += 1;
             }
-            ep.dips <= tolerated
+            let keep = ep.dips <= tolerated;
+            if !keep && let Some(d) = ep.fired.take() {
+                over.push(ended(d));
+            }
+            keep
         });
-        raised
+        out.extend(over);
+        out
     }
+}
+
+/// The last detection of an episode, marked as over (at the time it was last elevated).
+fn ended(mut d: Detection) -> Detection {
+    d.phase = Phase::Ended;
+    d
 }
 
 /// How far above normal, in percent of the baseline median. `floor` stands in for a median that is
@@ -230,7 +265,7 @@ mod tests {
         }
     }
 
-    /// Feed one reading per 5 s tick; returns every detection with the tick it came at.
+    /// Feed one reading per 5 s tick; returns every episode start with the tick it came at.
     fn run(
         det: &mut LevelDetector,
         b: &HashMap<String, BaselineStats>,
@@ -240,7 +275,9 @@ mod tests {
         for (i, v) in values.iter().enumerate() {
             let ts = i as i64 * TICK_MS;
             for d in det.observe_tick(ts, &[reading(*v)], b) {
-                out.push((i, d));
+                if d.phase == Phase::Started {
+                    out.push((i, d));
+                }
             }
         }
         out
@@ -390,6 +427,104 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
+    }
+
+    // ---- lifecycle -----------------------------------------------------------------------
+
+    /// All detections of an episode, tick by tick.
+    fn phases(
+        det: &mut LevelDetector,
+        b: &HashMap<String, BaselineStats>,
+        values: &[f64],
+    ) -> Vec<Phase> {
+        let mut out = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            for d in det.observe_tick(i as i64 * TICK_MS, &[reading(*v)], b) {
+                out.push(d.phase);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_episode_starts_once_continues_every_tick_and_ends_when_it_calms() {
+        let b = baseline(8.0, 1.0, 10.0);
+        let mut values = vec![72.0; 30]; // elevated from tick 0; starts at tick 24
+        values.extend([8.0; 3]); // calm
+        let p = phases(&mut normal(), &b, &values);
+        assert_eq!(p.iter().filter(|x| **x == Phase::Started).count(), 1);
+        assert_eq!(
+            p.iter().filter(|x| **x == Phase::Ongoing).count(),
+            5,
+            "ticks 25 to 29"
+        );
+        assert_eq!(p.last(), Some(&Phase::Ended));
+        assert_eq!(p.iter().filter(|x| **x == Phase::Ended).count(), 1);
+    }
+
+    #[test]
+    fn the_ongoing_detection_grows_with_the_episode() {
+        let b = baseline(8.0, 1.0, 10.0);
+        let mut det = normal();
+        let mut last = None;
+        for i in 0..40 {
+            for d in det.observe_tick(i * TICK_MS, &[reading(72.0)], &b) {
+                last = Some(d);
+            }
+        }
+        let d = last.unwrap();
+        assert_eq!(d.phase, Phase::Ongoing);
+        assert_eq!(d.duration_ms, 39 * TICK_MS);
+        assert_eq!(d.subject, SUBJECT);
+    }
+
+    #[test]
+    fn an_episode_that_never_counted_ends_silently() {
+        let b = baseline(8.0, 1.0, 10.0);
+        let mut values = vec![72.0; 10]; // 45 s: not an anomaly
+        values.extend([8.0; 4]);
+        assert!(phases(&mut normal(), &b, &values).is_empty());
+    }
+
+    #[test]
+    fn a_subject_that_disappears_ends_its_anomaly() {
+        let b = baseline(8.0, 1.0, 10.0);
+        let mut det = normal();
+        for i in 0..30 {
+            det.observe_tick(i * TICK_MS, &[reading(72.0)], &b);
+        }
+        let mut ended = Vec::new();
+        for i in 30..34 {
+            ended.extend(det.observe_tick(i * TICK_MS, &[], &b));
+        }
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].phase, Phase::Ended);
+        assert_eq!(
+            ended[0].ts_ms,
+            29 * TICK_MS,
+            "ended as of its last elevated tick"
+        );
+    }
+
+    #[test]
+    fn losing_the_baseline_or_pausing_ends_an_active_anomaly() {
+        let b = baseline(8.0, 1.0, 10.0);
+        let mut det = normal();
+        for i in 0..30 {
+            det.observe_tick(i * TICK_MS, &[reading(72.0)], &b);
+        }
+        let gone = det.observe_tick(30 * TICK_MS, &[reading(72.0)], &HashMap::new());
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].phase, Phase::Ended);
+
+        let mut det = normal();
+        for i in 0..30 {
+            det.observe_tick(i * TICK_MS, &[reading(72.0)], &b);
+        }
+        let paused = det.reset();
+        assert_eq!(paused.len(), 1);
+        assert_eq!(paused[0].phase, Phase::Ended);
+        assert!(det.reset().is_empty());
     }
 
     // ---- the other metrics ---------------------------------------------------------------

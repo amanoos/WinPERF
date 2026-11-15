@@ -1,6 +1,7 @@
-//! Turns each tick's batch into anomaly events: sums each metric per executable (the baseline
+//! Turns each tick's batch into anomaly changes: sums each metric per executable (the baseline
 //! subject), hands the totals to a level detector per metric, feeds every instance's private
-//! memory to the leak detector, and wraps what they find in full [`AnomalyEvent`]s.
+//! memory to the leak detector, weighs what they find against the state of the system, and
+//! follows each anomaly through its life (raised, updated while it lasts, resolved when it ends).
 //!
 //! The tracker only ever sees baselines the caller considers usable (confidence above
 //! Insufficient) and can be switched off, which is how profiling mode holds detection back.
@@ -8,8 +9,10 @@
 use super::leak::{self, LeakDetection, LeakDetector, LeakReading};
 use super::level::{self, Detection, LevelDetector, Reading, deviation_percent};
 use super::rules::{LeakRule, LevelRule};
+use super::severity::assess;
 use super::{
-    AnomalyEvent, AnomalyKind, BaselineSet, Sensitivities, Severity, SystemHealth, resource_of,
+    AnomalyChange, AnomalyEvent, AnomalyKind, BaselineSet, Phase, Sensitivities, Severity,
+    SystemHealth, resource_of,
 };
 use crate::ProcessKey;
 use crate::config::Resource;
@@ -25,11 +28,20 @@ const METRICS: usize = BaselineMetric::ALL.len();
 /// baseline growth does not make the figure explode.
 const GROWTH_FLOOR_PER_HOUR: f64 = 1024.0 * 1024.0;
 
+/// An anomaly that is going on is re-reported at most this often (sooner if it gets more severe).
+const UPDATE_EVERY_MS: i64 = 30_000;
+
 struct ProcInfo {
     /// Lower-cased executable path: matches `executables.path_key` and the baseline subject.
     subject: String,
     name: String,
     exe_path: String,
+}
+
+/// What the tracker last reported about an active anomaly.
+struct Active {
+    last_reported_ms: i64,
+    severity: Severity,
 }
 
 pub struct AnomalyTracker {
@@ -38,6 +50,8 @@ pub struct AnomalyTracker {
     procs: HashMap<ProcessKey, ProcInfo>,
     baselines: BaselineSet,
     enabled: bool,
+    active: HashMap<String, Active>,
+    last_ts_ms: i64,
 }
 
 /// One subject's per-metric totals for a tick.
@@ -76,6 +90,8 @@ impl AnomalyTracker {
             procs: HashMap::new(),
             baselines: BaselineSet::new(),
             enabled: true,
+            active: HashMap::new(),
+            last_ts_ms: 0,
         }
     }
 
@@ -84,20 +100,37 @@ impl AnomalyTracker {
         self.baselines = baselines;
     }
 
-    /// Pause or resume detection. Pausing forgets any episode in progress, so resuming starts
-    /// every clock from zero. Process tracking continues either way.
-    pub fn set_enabled(&mut self, enabled: bool) {
-        if !enabled {
+    /// Pause or resume detection. Pausing forgets any episode in progress (so resuming starts
+    /// every clock from zero) and resolves the anomalies that were active. Process tracking
+    /// continues either way.
+    pub fn set_enabled(&mut self, enabled: bool) -> Vec<AnomalyChange> {
+        let mut changes = Vec::new();
+        if !enabled && self.enabled {
+            let mut ended: Vec<String> = Vec::new();
             for d in &mut self.levels {
-                d.reset();
+                ended.extend(d.reset().iter().map(level_key));
             }
-            self.leak.reset();
+            ended.extend(self.leak.reset().iter().map(leak_key));
+            for key in ended {
+                if self.active.remove(&key).is_some() {
+                    changes.push(AnomalyChange::Resolved {
+                        key,
+                        ts_ms: self.last_ts_ms,
+                    });
+                }
+            }
         }
         self.enabled = enabled;
+        changes
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Anomalies currently active.
+    pub fn active_count(&self) -> usize {
+        self.active.len()
     }
 
     /// Subjects with a usable CPU baseline (a rough size of what is being watched).
@@ -105,7 +138,8 @@ impl AnomalyTracker {
         self.baselines.subjects(BaselineMetric::Cpu)
     }
 
-    pub fn ingest(&mut self, batch: &TickBatch) -> Vec<AnomalyEvent> {
+    pub fn ingest(&mut self, batch: &TickBatch) -> Vec<AnomalyChange> {
+        self.last_ts_ms = batch.ts_ms;
         for raw in &batch.new {
             if let (Some(start), Some(path)) = (raw.start_time, raw.exe_path.as_ref()) {
                 let exe_path = path.to_string_lossy().into_owned();
@@ -120,21 +154,67 @@ impl AnomalyTracker {
             }
         }
 
-        let health = system_health(batch.system.as_ref());
-        let mut events = Vec::new();
+        let mut changes = Vec::new();
         if self.enabled {
+            let system = batch.system.as_ref();
+            let health = system_health(system);
             for d in self.detect_levels(batch) {
-                events.push(level_event(d, health));
+                let make = |held: Severity| level_event(&d, health, system, held);
+                self.follow(level_key(&d), d.phase, d.ts_ms, make, &mut changes);
             }
             for d in self.detect_leaks(batch) {
-                events.push(leak_event(d, health));
+                let make = |held: Severity| leak_event(&d, health, system, held);
+                self.follow(leak_key(&d), d.phase, d.ts_ms, make, &mut changes);
             }
         }
 
         for key in &batch.gone {
             self.procs.remove(key);
         }
-        events
+        changes
+    }
+
+    /// Turn one detection into the right change for its anomaly: a new event, an update (when it
+    /// got worse or enough time has passed), or its resolution. `make` builds the event given the
+    /// highest severity reached so far, which an active anomaly never drops below.
+    fn follow(
+        &mut self,
+        key: String,
+        phase: Phase,
+        ts_ms: i64,
+        make: impl Fn(Severity) -> AnomalyEvent,
+        changes: &mut Vec<AnomalyChange>,
+    ) {
+        match phase {
+            Phase::Started => {
+                let event = make(Severity::Informational);
+                self.active.insert(
+                    key.clone(),
+                    Active {
+                        last_reported_ms: ts_ms,
+                        severity: event.severity,
+                    },
+                );
+                changes.push(AnomalyChange::Raised { key, event });
+            }
+            Phase::Ongoing => {
+                let Some(active) = self.active.get_mut(&key) else {
+                    return;
+                };
+                let event = make(active.severity);
+                let worse = event.severity > active.severity;
+                if worse || ts_ms - active.last_reported_ms >= UPDATE_EVERY_MS {
+                    active.severity = event.severity;
+                    active.last_reported_ms = ts_ms;
+                    changes.push(AnomalyChange::Updated { key, event });
+                }
+            }
+            Phase::Ended => {
+                if self.active.remove(&key).is_some() {
+                    changes.push(AnomalyChange::Resolved { key, ts_ms });
+                }
+            }
+        }
     }
 
     fn detect_levels(&mut self, batch: &TickBatch) -> Vec<Detection> {
@@ -202,6 +282,14 @@ impl AnomalyTracker {
     }
 }
 
+fn level_key(d: &Detection) -> String {
+    format!("level|{}|{}", d.rule.metric.as_str(), d.subject)
+}
+
+fn leak_key(d: &LeakDetection) -> String {
+    format!("leak|{}", d.key)
+}
+
 fn system_health(system: Option<&SystemSample>) -> SystemHealth {
     let Some(s) = system else {
         return SystemHealth::default();
@@ -218,41 +306,83 @@ fn system_health(system: Option<&SystemSample>) -> SystemHealth {
     SystemHealth {
         cpu_percent: s.cpu_percent.value().copied(),
         memory_percent,
+        disk_percent: s.disk_utilization_percent.value().copied(),
     }
 }
 
-fn level_event(d: Detection, system: SystemHealth) -> AnomalyEvent {
-    let explanation = level::explain(&d);
+/// The process's share of what the whole system is doing with this metric, percent. For CPU that
+/// is its own use (already a percent of the machine); for memory, of physical memory; for disk and
+/// network, of the system's traffic in the same direction.
+fn level_share(metric: BaselineMetric, current: f64, system: Option<&SystemSample>) -> Option<f64> {
+    let of = |total: f64| (total > 0.0).then(|| current / total * 100.0);
+    let s = system?;
+    match metric {
+        BaselineMetric::Cpu => Some(current),
+        BaselineMetric::Memory => of(*s.memory_total_bytes.value()? as f64),
+        BaselineMetric::DiskRead => of(*s.disk_read_bytes_per_sec.value()?),
+        BaselineMetric::DiskWrite => of(*s.disk_write_bytes_per_sec.value()?),
+        BaselineMetric::NetRx => of(*s.net_rx_bytes_per_sec.value()?),
+        BaselineMetric::NetTx => of(*s.net_tx_bytes_per_sec.value()?),
+    }
+}
+
+/// Append the impact sentence, and note when the severity is held at an earlier, higher level.
+fn with_impact(explanation: String, reason: &str, assessed: Severity, held: Severity) -> String {
+    if held > assessed {
+        format!(
+            "{explanation} Impact: {reason} Severity stays at {} because it was that high \
+             earlier in this episode.",
+            held.label()
+        )
+    } else {
+        format!("{explanation} Impact: {reason}")
+    }
+}
+
+fn level_event(
+    d: &Detection,
+    health: SystemHealth,
+    system: Option<&SystemSample>,
+    held: Severity,
+) -> AnomalyEvent {
+    let resource = resource_of(d.rule.metric);
+    let share = level_share(d.rule.metric, d.current, system);
+    let assessed = assess(resource, share, &health);
     AnomalyEvent {
         detected_ts_ms: d.ts_ms,
         pid: d.top.pid,
         start_time: d.top.start_time,
-        process_name: d.name,
-        exe_path: d.exe_path,
-        resource: resource_of(d.rule.metric),
+        process_name: d.name.clone(),
+        exe_path: d.exe_path.clone(),
+        resource,
         kind: AnomalyKind::Deviation,
         current: d.current,
         baseline: d.baseline.median,
         deviation_pct: deviation_percent(d.current, d.baseline.median, d.rule.baseline_floor()),
         duration_ms: d.duration_ms,
-        // Every detector event starts as a plain deviation; weighing it against system pressure
-        // (High/Critical, or Informational when nothing suffers) is a later step.
-        severity: Severity::Warning,
-        system,
+        severity: assessed.severity.max(held),
+        system: health,
+        impact: assessed.impact,
         baseline_window_hours: d.baseline.window_hours,
         baseline_confidence: d.baseline.confidence,
-        explanation,
+        explanation: with_impact(level::explain(d), &assessed.reason, assessed.severity, held),
     }
 }
 
-fn leak_event(d: LeakDetection, system: SystemHealth) -> AnomalyEvent {
-    let explanation = leak::explain(&d);
+fn leak_event(
+    d: &LeakDetection,
+    health: SystemHealth,
+    system: Option<&SystemSample>,
+    held: Severity,
+) -> AnomalyEvent {
+    let share = level_share(BaselineMetric::Memory, d.current_bytes, system);
+    let assessed = assess(Resource::Memory, share, &health);
     AnomalyEvent {
         detected_ts_ms: d.ts_ms,
         pid: d.key.pid,
         start_time: d.key.start_time,
-        process_name: d.name,
-        exe_path: d.exe_path,
+        process_name: d.name.clone(),
+        exe_path: d.exe_path.clone(),
         resource: Resource::Memory,
         kind: AnomalyKind::MemoryGrowth,
         current: d.rate_per_hour,
@@ -260,24 +390,24 @@ fn leak_event(d: LeakDetection, system: SystemHealth) -> AnomalyEvent {
         deviation_pct: (d.rate_per_hour / d.usual_rate_per_hour.max(GROWTH_FLOOR_PER_HOUR) - 1.0)
             * 100.0,
         duration_ms: d.span_ms,
-        severity: Severity::Warning,
-        system,
+        severity: assessed.severity.max(held),
+        system: health,
+        impact: assessed.impact,
         baseline_window_hours: d.baseline.window_hours,
         baseline_confidence: d.baseline.confidence,
-        explanation,
+        explanation: with_impact(leak::explain(d), &assessed.reason, assessed.severity, held),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::BaselineStats;
     use super::*;
     use crate::Metric;
     use crate::config::Sensitivity;
     use crate::inventory::RawProcess;
     use crate::profiler::confidence::Confidence;
     use std::path::PathBuf;
-
-    use super::super::BaselineStats;
 
     const PATH: &str = r"C:\Apps\Busy.exe";
     const MIB: f64 = 1024.0 * 1024.0;
@@ -354,40 +484,15 @@ mod tests {
         }
     }
 
-    /// Ticks 5 s apart; `make` builds each tick's samples. Instances start on the first tick.
-    fn drive(
-        t: &mut AnomalyTracker,
-        ticks: usize,
-        pids: &[u32],
-        make: impl Fn(usize, u32) -> Sample,
-    ) -> Vec<AnomalyEvent> {
-        let mut events = Vec::new();
-        for i in 0..ticks {
-            let new = if i == 0 {
-                pids.iter().map(|p| started(*p, PATH)).collect()
-            } else {
-                Vec::new()
-            };
-            let samples = pids.iter().map(|p| make(i, *p)).collect();
-            events.extend(t.ingest(&batch(i as i64 * 5_000, new, samples)));
-        }
-        events
-    }
-
-    fn cpu_only(cpus: &'static [(u32, f64)]) -> impl Fn(usize, u32) -> Sample {
-        move |_, pid| {
-            let cpu = cpus.iter().find(|(p, _)| *p == pid).unwrap().1;
-            sample(pid, cpu)
-        }
-    }
-
-    #[test]
-    fn a_sustained_burn_becomes_an_event_with_every_field() {
-        let mut t = tracker();
-        let system = SystemSample {
-            cpu_percent: Metric::Available(91.0),
-            memory_total_bytes: Metric::Available(16_000),
-            memory_available_bytes: Metric::Available(4_000),
+    /// A system sample with the given CPU and memory use and an 8 GiB machine.
+    fn system(cpu: f64, memory_used_percent: f64) -> SystemSample {
+        let total = 8u64 * 1024 * 1024 * 1024;
+        SystemSample {
+            cpu_percent: Metric::Available(cpu),
+            memory_total_bytes: Metric::Available(total),
+            memory_available_bytes: Metric::Available(
+                (total as f64 * (1.0 - memory_used_percent / 100.0)) as u64,
+            ),
             commit_used_bytes: Metric::Unavailable,
             commit_limit_bytes: Metric::Unavailable,
             disk_utilization_percent: Metric::Unavailable,
@@ -397,18 +502,86 @@ mod tests {
             disk_latency_ms: Metric::Unavailable,
             net_rx_bytes_per_sec: Metric::Unavailable,
             net_tx_bytes_per_sec: Metric::Unavailable,
-        };
-        let mut events = Vec::new();
-        for i in 0..=24 {
+        }
+    }
+
+    fn raised(changes: &[AnomalyChange]) -> Vec<AnomalyEvent> {
+        changes
+            .iter()
+            .filter_map(|c| match c {
+                AnomalyChange::Raised { event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ticks 5 s apart; `make` builds each tick's samples. Instances start on the first tick.
+    /// Returns every change.
+    fn drive_changes(
+        t: &mut AnomalyTracker,
+        ticks: usize,
+        pids: &[u32],
+        make: impl Fn(usize, u32) -> Sample,
+    ) -> Vec<AnomalyChange> {
+        let mut changes = Vec::new();
+        for i in 0..ticks {
+            let new = if i == 0 {
+                pids.iter().map(|p| started(*p, PATH)).collect()
+            } else {
+                Vec::new()
+            };
+            let samples = pids.iter().map(|p| make(i, *p)).collect();
+            changes.extend(t.ingest(&batch(i as i64 * 5_000, new, samples)));
+        }
+        changes
+    }
+
+    fn drive(
+        t: &mut AnomalyTracker,
+        ticks: usize,
+        pids: &[u32],
+        make: impl Fn(usize, u32) -> Sample,
+    ) -> Vec<AnomalyEvent> {
+        raised(&drive_changes(t, ticks, pids, make))
+    }
+
+    fn cpu_only(cpus: &'static [(u32, f64)]) -> impl Fn(usize, u32) -> Sample {
+        move |_, pid| {
+            let cpu = cpus.iter().find(|(p, _)| *p == pid).unwrap().1;
+            sample(pid, cpu)
+        }
+    }
+
+    /// One process at `cpu`% on a system with the given load, for `ticks` ticks.
+    fn burn_on(system_cpu: f64, mem: f64, cpu: f64, ticks: usize) -> Vec<AnomalyChange> {
+        burn_with(tracker(), system_cpu, mem, cpu, ticks)
+    }
+
+    fn burn_with(
+        mut t: AnomalyTracker,
+        system_cpu: f64,
+        mem: f64,
+        cpu: f64,
+        ticks: usize,
+    ) -> Vec<AnomalyChange> {
+        let mut changes = Vec::new();
+        for i in 0..ticks {
             let new = if i == 0 {
                 vec![started(7, PATH)]
             } else {
                 vec![]
             };
-            let mut b = batch(i * 5_000, new, vec![sample(7, 72.0)]);
-            b.system = Some(system.clone());
-            events.extend(t.ingest(&b));
+            let mut b = batch(i as i64 * 5_000, new, vec![sample(7, cpu)]);
+            b.system = Some(system(system_cpu, mem));
+            changes.extend(t.ingest(&b));
         }
+        changes
+    }
+
+    #[test]
+    fn a_sustained_burn_becomes_an_event_with_every_field() {
+        let changes = burn_on(91.0, 75.0, 72.0, 25);
+        let events = raised(&changes);
 
         assert_eq!(events.len(), 1);
         let e = &events[0];
@@ -423,12 +596,16 @@ mod tests {
         assert_eq!(e.deviation_pct, 800.0);
         assert_eq!(e.duration_ms, 120_000);
         assert_eq!(e.detected_ts_ms, 120_000);
-        assert_eq!(e.severity, Severity::Warning);
         assert_eq!(e.system.cpu_percent, Some(91.0));
-        assert_eq!(e.system.memory_percent, Some(75.0));
+        assert!((e.system.memory_percent.unwrap() - 75.0).abs() < 0.01);
         assert_eq!(e.baseline_window_hours, 24);
         assert_eq!(e.baseline_confidence, Confidence::Established);
         assert!(e.explanation.contains("Busy.exe"), "{}", e.explanation);
+        assert!(e.explanation.contains("Impact:"), "{}", e.explanation);
+        // 91% busy and this process is 72% of it.
+        assert_eq!(e.severity, Severity::High);
+        assert_eq!(e.impact.share_percent, Some(72.0));
+        assert_eq!(e.impact.pressure_percent, Some(91.0));
     }
 
     #[test]
@@ -467,15 +644,15 @@ mod tests {
         t.set_enabled(true);
         // Processes already known keep being tracked while paused, and the clock starts afresh:
         // 20 ticks is 95 s, short of the 120 s.
-        let mut events = Vec::new();
+        let mut changes = Vec::new();
         for i in 0..20 {
-            events.extend(t.ingest(&batch(1_000_000 + i * 5_000, vec![], vec![sample(1, 95.0)])));
+            changes.extend(t.ingest(&batch(1_000_000 + i * 5_000, vec![], vec![sample(1, 95.0)])));
         }
-        assert!(events.is_empty());
+        assert!(raised(&changes).is_empty());
         for i in 20..30 {
-            events.extend(t.ingest(&batch(1_000_000 + i * 5_000, vec![], vec![sample(1, 95.0)])));
+            changes.extend(t.ingest(&batch(1_000_000 + i * 5_000, vec![], vec![sample(1, 95.0)])));
         }
-        assert_eq!(events.len(), 1);
+        assert_eq!(raised(&changes).len(), 1);
     }
 
     #[test]
@@ -484,11 +661,11 @@ mod tests {
         let mut t = tracker();
         let mut raw = started(1, PATH);
         raw.exe_path = None;
-        let mut events = t.ingest(&batch(0, vec![raw], vec![sample(1, 95.0)]));
+        let mut changes = t.ingest(&batch(0, vec![raw], vec![sample(1, 95.0)]));
         for i in 1..40 {
-            events.extend(t.ingest(&batch(i * 5_000, vec![], vec![sample(1, 95.0)])));
+            changes.extend(t.ingest(&batch(i * 5_000, vec![], vec![sample(1, 95.0)])));
         }
-        assert!(events.is_empty());
+        assert!(changes.is_empty());
     }
 
     #[test]
@@ -496,11 +673,11 @@ mod tests {
         let mut t = tracker();
         let mut s = sample(1, 0.0);
         s.cpu_percent = Metric::Unavailable;
-        let mut events = t.ingest(&batch(0, vec![started(1, PATH)], vec![s.clone()]));
+        let mut changes = t.ingest(&batch(0, vec![started(1, PATH)], vec![s.clone()]));
         for i in 1..40 {
-            events.extend(t.ingest(&batch(i * 5_000, vec![], vec![s.clone()])));
+            changes.extend(t.ingest(&batch(i * 5_000, vec![], vec![s.clone()])));
         }
-        assert!(events.is_empty());
+        assert!(changes.is_empty());
     }
 
     #[test]
@@ -640,7 +817,7 @@ mod tests {
         // Instances come and go, so the executable's total private memory climbs, but no single
         // process is growing: nothing to report.
         let mut t = tracker();
-        let mut events = Vec::new();
+        let mut changes = Vec::new();
         for i in 0..480usize {
             let generation = (i / 12) as u32; // a new process every minute
             let pid = 1000 + generation;
@@ -657,8 +834,280 @@ mod tests {
             };
             let mut s = sample(pid, 1.0);
             s.private_bytes = Metric::Available((200.0 * MIB) as u64);
-            events.extend(t.ingest(&batch(i as i64 * 5_000, new, vec![s])));
+            changes.extend(t.ingest(&batch(i as i64 * 5_000, new, vec![s])));
         }
-        assert!(events.is_empty());
+        assert!(changes.is_empty());
+    }
+
+    // ---- severity from system pressure ---------------------------------------------------
+
+    #[test]
+    fn the_same_fifteen_percent_burn_ranks_by_how_much_the_system_suffers() {
+        // A process that normally idles around 2% suddenly uses 15%.
+        let severity = |system_cpu: f64| {
+            let mut t = tracker();
+            let mut set = BaselineSet::new();
+            set.insert(
+                BaselineMetric::Cpu,
+                PATH.to_lowercase(),
+                stats(2.0, 0.2, 3.0, None),
+            );
+            t.set_baselines(set);
+            let events = raised(&burn_with(t, system_cpu, 40.0, 15.0, 30));
+            assert_eq!(events.len(), 1, "system at {system_cpu}%");
+            events[0].severity
+        };
+        assert_eq!(severity(20.0), Severity::Informational, "idle machine");
+        assert_eq!(severity(70.0), Severity::Warning, "busy machine");
+        assert_eq!(severity(90.0), Severity::High, "saturated machine");
+    }
+
+    #[test]
+    fn a_dominant_process_on_a_saturated_machine_is_critical() {
+        let events = raised(&burn_on(98.0, 40.0, 60.0, 30));
+        assert_eq!(events[0].severity, Severity::Critical);
+        assert!(events[0].impact.score.unwrap() > 50.0);
+    }
+
+    #[test]
+    fn a_memory_hog_is_judged_by_memory_pressure() {
+        let mut t = tracker();
+        let mut changes = Vec::new();
+        for i in 0..80 {
+            let new = if i == 0 {
+                vec![started(1, PATH)]
+            } else {
+                vec![]
+            };
+            let mut s = sample(1, 1.0);
+            s.working_set = Metric::Available((2048.0 * MIB) as u64);
+            let mut b = batch(i as i64 * 5_000, new, vec![s]);
+            b.system = Some(system(10.0, 92.0)); // CPU idle, memory nearly full
+            changes.extend(t.ingest(&b));
+        }
+        let e = &raised(&changes)[0];
+        assert_eq!(e.resource, Resource::Memory);
+        assert_eq!(e.severity, Severity::High);
+        assert_eq!(e.impact.pressure_percent.map(|p| p.round()), Some(92.0));
+        assert_eq!(e.impact.share_percent.map(|p| p.round()), Some(25.0));
+    }
+
+    // ---- lifecycle -----------------------------------------------------------------------
+
+    fn kinds(changes: &[AnomalyChange]) -> Vec<&'static str> {
+        changes
+            .iter()
+            .map(|c| match c {
+                AnomalyChange::Raised { .. } => "raised",
+                AnomalyChange::Updated { .. } => "updated",
+                AnomalyChange::Resolved { .. } => "resolved",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_condition_that_goes_on_updates_one_event_instead_of_raising_more() {
+        // 10 minutes of the same burn: one event, then occasional updates, never a second event.
+        let changes = burn_on(50.0, 40.0, 72.0, 120);
+        let k = kinds(&changes);
+        assert_eq!(k.iter().filter(|x| **x == "raised").count(), 1, "{k:?}");
+        let updates = k.iter().filter(|x| **x == "updated").count();
+        assert!(
+            (14..=17).contains(&updates),
+            "about one update every 30 s for the 8 minutes after the start: {updates}"
+        );
+        assert!(!k.contains(&"resolved"));
+        // The updates carry the growing duration.
+        let last = changes
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                AnomalyChange::Updated { event, .. } => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        assert!(last.duration_ms > 500_000, "{}", last.duration_ms);
+        // All of them name the same condition.
+        let keys: std::collections::HashSet<_> = changes
+            .iter()
+            .map(|c| match c {
+                AnomalyChange::Raised { key, .. }
+                | AnomalyChange::Updated { key, .. }
+                | AnomalyChange::Resolved { key, .. } => key.clone(),
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+    }
+
+    #[test]
+    fn the_event_is_resolved_when_the_condition_ends() {
+        let mut t = tracker();
+        let mut changes = Vec::new();
+        for i in 0..40 {
+            let new = if i == 0 {
+                vec![started(7, PATH)]
+            } else {
+                vec![]
+            };
+            let cpu = if i < 30 { 72.0 } else { 3.0 };
+            changes.extend(t.ingest(&batch(i as i64 * 5_000, new, vec![sample(7, cpu)])));
+        }
+        let k = kinds(&changes);
+        assert_eq!(k.last(), Some(&"resolved"), "{k:?}");
+        assert_eq!(k.iter().filter(|x| **x == "resolved").count(), 1);
+        let AnomalyChange::Resolved { ts_ms, .. } = changes.last().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(*ts_ms, 29 * 5_000, "resolved as of the last elevated tick");
+        assert_eq!(t.active_count(), 0);
+    }
+
+    #[test]
+    fn a_new_episode_after_resolution_is_a_new_event() {
+        let mut t = tracker();
+        let mut changes = Vec::new();
+        for i in 0..100 {
+            let new = if i == 0 {
+                vec![started(7, PATH)]
+            } else {
+                vec![]
+            };
+            let cpu = if (35..45).contains(&i) { 3.0 } else { 72.0 };
+            changes.extend(t.ingest(&batch(i as i64 * 5_000, new, vec![sample(7, cpu)])));
+        }
+        assert_eq!(raised(&changes).len(), 2);
+    }
+
+    #[test]
+    fn severity_only_goes_up_while_an_event_is_active() {
+        // The burn starts on a busy machine (Warning), the system then saturates (High), and
+        // later eases: the event keeps its worst severity.
+        let mut t = tracker();
+        let mut changes = Vec::new();
+        for i in 0..160 {
+            let new = if i == 0 {
+                vec![started(7, PATH)]
+            } else {
+                vec![]
+            };
+            let load = match i {
+                0..=60 => 70.0,
+                61..=100 => 90.0,
+                _ => 30.0,
+            };
+            let mut b = batch(i as i64 * 5_000, new, vec![sample(7, 35.0)]);
+            b.system = Some(system(load, 40.0));
+            changes.extend(t.ingest(&b));
+        }
+        let severities: Vec<Severity> = changes
+            .iter()
+            .filter_map(|c| match c {
+                AnomalyChange::Raised { event, .. } | AnomalyChange::Updated { event, .. } => {
+                    Some(event.severity)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(severities[0], Severity::Warning);
+        assert!(severities.contains(&Severity::High), "{severities:?}");
+        assert!(
+            severities.windows(2).all(|w| w[0] <= w[1]),
+            "never drops: {severities:?}"
+        );
+        let AnomalyChange::Updated { event, .. } = changes
+            .iter()
+            .rev()
+            .find(|c| matches!(c, AnomalyChange::Updated { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(event.severity, Severity::High);
+        assert!(
+            event.explanation.contains("Severity stays at High"),
+            "{}",
+            event.explanation
+        );
+    }
+
+    #[test]
+    fn a_worse_severity_is_reported_at_once() {
+        let mut t = tracker();
+        let mut changes = Vec::new();
+        for i in 0..36 {
+            let new = if i == 0 {
+                vec![started(7, PATH)]
+            } else {
+                vec![]
+            };
+            let load = if i < 30 { 70.0 } else { 90.0 };
+            let mut b = batch(i as i64 * 5_000, new, vec![sample(7, 35.0)]);
+            b.system = Some(system(load, 40.0));
+            changes.extend(t.ingest(&b));
+        }
+        // Raised at tick 24; the next update is not due for 30 s, but the jump to High at tick
+        // 30 is reported straight away.
+        let k = kinds(&changes);
+        assert_eq!(k, vec!["raised", "updated"], "{k:?}");
+        let AnomalyChange::Updated { event, .. } = &changes[1] else {
+            unreachable!()
+        };
+        assert_eq!(event.severity, Severity::High);
+        assert_eq!(event.detected_ts_ms, 30 * 5_000);
+    }
+
+    #[test]
+    fn pausing_resolves_the_active_anomalies() {
+        let mut t = tracker();
+        for i in 0..30 {
+            let new = if i == 0 {
+                vec![started(7, PATH)]
+            } else {
+                vec![]
+            };
+            t.ingest(&batch(i as i64 * 5_000, new, vec![sample(7, 72.0)]));
+        }
+        assert_eq!(t.active_count(), 1);
+        let resolved = t.set_enabled(false);
+        assert_eq!(kinds(&resolved), vec!["resolved"]);
+        assert_eq!(t.active_count(), 0);
+        assert!(t.set_enabled(true).is_empty());
+    }
+
+    #[test]
+    fn an_exiting_process_resolves_its_anomaly() {
+        let mut t = tracker();
+        let mut changes = Vec::new();
+        for i in 0..30 {
+            let new = if i == 0 {
+                vec![started(7, PATH)]
+            } else {
+                vec![]
+            };
+            changes.extend(t.ingest(&batch(i as i64 * 5_000, new, vec![sample(7, 72.0)])));
+        }
+        let mut gone = batch(30 * 5_000, vec![], vec![]);
+        gone.gone = vec![ProcessKey::new(7, 100)];
+        changes.extend(t.ingest(&gone));
+        for i in 31..34 {
+            changes.extend(t.ingest(&batch(i * 5_000, vec![], vec![])));
+        }
+        assert_eq!(kinds(&changes).last(), Some(&"resolved"));
+    }
+
+    #[test]
+    fn a_leak_is_one_event_that_resolves_when_memory_is_given_back() {
+        let mut t = tracker();
+        let changes = drive_changes(&mut t, 560, &[9], |i, pid| {
+            let mut s = ramp(3.0)(i, pid);
+            if i as f64 * 5.0 / 60.0 >= 40.0 {
+                s.private_bytes = Metric::Available((200.0 * MIB) as u64);
+            }
+            s
+        });
+        let k = kinds(&changes);
+        assert_eq!(k.iter().filter(|x| **x == "raised").count(), 1, "{k:?}");
+        assert!(k.contains(&"updated"));
+        assert_eq!(k.last(), Some(&"resolved"));
     }
 }

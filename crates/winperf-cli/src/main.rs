@@ -143,9 +143,12 @@ enum ProfileAction {
 enum AnomaliesAction {
     /// List detected anomalies, newest first
     List {
-        /// Only those from the last this many hours
+        /// Only those that were active in the last this many hours
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         hours: Option<u32>,
+        /// Only those still going on
+        #[arg(long)]
+        active: bool,
         /// Most events to show
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10000))]
         limit: u32,
@@ -388,10 +391,19 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
             let mut out = std::io::stdout().lock();
             match action {
-                AnomaliesAction::List { hours, limit } => {
-                    commands::anomalies::list(&db, hours, limit, unix_millis_now(), &mut out)
-                        .map_err(|e| e.to_string())
-                }
+                AnomaliesAction::List {
+                    hours,
+                    active,
+                    limit,
+                } => commands::anomalies::list(
+                    &db,
+                    hours,
+                    active,
+                    limit,
+                    unix_millis_now(),
+                    &mut out,
+                )
+                .map_err(|e| e.to_string()),
                 AnomaliesAction::Show { id } => {
                     commands::anomalies::show(&db, id, &mut out).map_err(|e| e.to_string())
                 }
