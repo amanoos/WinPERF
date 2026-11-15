@@ -12,18 +12,18 @@ clean slate, add `--db C:\temp\walk.db` to every command (and to `winperf-report
 
 | # | MVP item | Do this | You should see | Seen |
 |---|---|---|---|---|
-| 1 | Installed application inventory | `winperf inventory scan` | A list of installed programs with name, version, publisher and install location | [ ] |
-| 2 | Running process inventory | `winperf process list` | Running processes with PID, path and publisher | [ ] |
-| 3 | Microsoft vs third-party | Same two commands; also `winperf inventory exe "C:\Windows\System32\notepad.exe"` | A classification (Microsoft / third party / unknown) on each row; the exe command shows the signer and why | [ ] |
-| 4 | CPU monitoring | `winperf tui` (press `q` to leave) | Whole-machine CPU and a per-process CPU column that you can sort | [ ] |
-| 5 | Memory monitoring | Same dashboard | Memory in use, and per-process working set | [ ] |
-| 6 | Disk I/O | Same dashboard; `winperf system now` | Disk busy, throughput and per-process I/O | [ ] |
-| 7 | Network I/O | `winperf system now`; in an **elevated** prompt `winperf network now` | System network rates; with administrator rights, the processes using the network (without it, the tool says per-process network is unavailable) | [ ] |
+| 1 | Installed application inventory | `winperf inventory scan` | A list of installed programs with name, version, publisher and install location | [x] |
+| 2 | Running process inventory | `winperf process list` | Running processes with PID, path and publisher | [x] |
+| 3 | Microsoft vs third-party | Same two commands; also `winperf inventory exe "C:\Windows\System32\notepad.exe"` | A classification (Microsoft / third party / unknown) on each row; the exe command shows the signer and why | [x] |
+| 4 | CPU monitoring | `winperf tui` (press `q` to leave) | Whole-machine CPU and a per-process CPU column that you can sort | [x] |
+| 5 | Memory monitoring | Same dashboard | Memory in use, and per-process working set | [x] |
+| 6 | Disk I/O | Same dashboard; `winperf system now` | Disk busy, throughput and per-process I/O | [x] |
+| 7 | Network I/O | `winperf system now`; in an **elevated** prompt `winperf network now` | System network rates; with administrator rights, the processes using the network (without it, the tool says per-process network is unavailable) | [x] |
 | 8 | Historical SQLite storage | `winperf monitor run` for a few minutes (Ctrl+C), then `winperf monitor status` | Sample counts and the database size growing; the file exists at the path shown | [ ] |
-| 9 | Baseline generation | `winperf baseline update`, then `winperf baseline list` | A baseline (typical, p95, peak, confidence) per program | [ ] |
+| 9 | Baseline generation | `winperf baseline update`, then `winperf baseline list` | A baseline (typical, p95, peak, confidence) per program | [x] |
 | 10 | Statistical anomaly detection | `winperf anomalies list` and `winperf anomalies show <id>` | Detected events with severity, actual vs baseline, and the explanation text | [ ] |
-| 11 | Ratatui terminal dashboard | `winperf tui` | System health header, sortable process table, anomaly view, settings | [ ] |
-| 12 | Basic browser reporting | `winperf-report` then open http://localhost:8099 | The dashboard (see Part 3) | [ ] |
+| 11 | Ratatui terminal dashboard | `winperf tui` | System health header, sortable process table, anomaly view, settings | [x] |
+| 12 | Basic browser reporting | `winperf-report` then open http://localhost:8099 | The dashboard (see Part 3) | [x] |
 
 Notes for item 10: detection holds back while profiling mode is on (`winperf profile status`); a
 fresh database has no baselines, so expect nothing until the monitor has run for a while. To see
