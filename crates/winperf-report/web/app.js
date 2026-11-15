@@ -341,6 +341,7 @@
     groupKey = key;
     try { localStorage.setItem('winperf.group', key); } catch (_) { /* optional */ }
     markGroup();
+    updateExports();
     const { from, to } = window_();
     loadRankings(from, to);
   });
@@ -750,6 +751,22 @@
   }
   window.addEventListener('hashchange', route);
 
+  // ---- downloads -----------------------------------------------------------------------------
+
+  // The links carry the selected range, the grouping and the token, so a click downloads what is
+  // on screen. They are plain links: the browser streams the file to disk.
+  function updateExports() {
+    const { from, to } = window_();
+    const metric = $('export-metric').value;
+    document.querySelectorAll('#exports a').forEach((a) => {
+      const q = new URLSearchParams({ format: a.dataset.format, from_ms: String(Math.floor(from)), to_ms: String(Math.ceil(to)) });
+      if (a.dataset.export === 'rankings') { q.set('metric', metric); q.set('group', groupKey); }
+      if (token) q.set('token', token);
+      a.href = '/api/export/' + a.dataset.export + '?' + q.toString();
+    });
+  }
+  $('export-metric').addEventListener('change', updateExports);
+
   // ---- loading -------------------------------------------------------------------------------
 
   function window_() {
@@ -764,6 +781,7 @@
     busy = true;
     const { from, to } = window_();
     if (force || Date.now() - rankingsAt > 30000) loadRankings(from, to);
+    updateExports();
     try {
       const results = await Promise.allSettled([
         api('/api/status'),

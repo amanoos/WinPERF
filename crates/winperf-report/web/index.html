@@ -61,6 +61,18 @@
       <p id="rankings-note" class="mt-2 text-xs text-slate-500"></p>
     </section>
 
+    <section class="rounded-lg bg-white p-4 shadow" aria-label="Export">
+      <h2 class="mb-1 font-medium">Download data for the selected time range</h2>
+      <p class="mb-2 text-xs text-slate-500">CSV opens in a spreadsheet (text that could be a formula is marked with a leading apostrophe); JSON keeps the text as it is. Times are Unix milliseconds, UTC.</p>
+      <div id="exports" class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+        <span>System history <a data-export="history" data-format="csv" class="text-sky-700 hover:underline" href="#/">CSV</a> · <a data-export="history" data-format="json" class="text-sky-700 hover:underline" href="#/">JSON</a></span>
+        <span>Anomalies <a data-export="anomalies" data-format="csv" class="text-sky-700 hover:underline" href="#/">CSV</a> · <a data-export="anomalies" data-format="json" class="text-sky-700 hover:underline" href="#/">JSON</a></span>
+        <span>Ranking
+          <select id="export-metric" class="rounded bg-slate-100 px-1 py-0.5"><option value="cpu">CPU</option><option value="memory">Memory</option><option value="disk_read">Disk read</option><option value="disk_write">Disk write</option><option value="net_rx">Network received</option><option value="net_tx">Network sent</option></select>
+          (as grouped above) <a data-export="rankings" data-format="csv" class="text-sky-700 hover:underline" href="#/">CSV</a> · <a data-export="rankings" data-format="json" class="text-sky-700 hover:underline" href="#/">JSON</a></span>
+      </div>
+    </section>
+
     <section class="grid grid-cols-1 gap-4 lg:grid-cols-2">
       <div class="rounded-lg bg-white p-4 shadow">
         <h2 class="mb-2 font-medium">Top consumers right now</h2>

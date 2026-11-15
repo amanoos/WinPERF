@@ -548,3 +548,121 @@ async fn one_event_comes_with_the_process_and_system_around_it() {
     assert!(!system.is_empty());
     assert_eq!(system[0]["cpu_percent"], 20.0);
 }
+
+async fn raw(app: &axum::Router, uri: &str) -> (StatusCode, String, axum::http::HeaderMap) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("host", "localhost:8099")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 26)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap(), headers)
+}
+
+#[tokio::test]
+async fn the_history_downloads_as_csv_and_json_with_one_row_per_sample() {
+    let s = Scratch::new();
+    seed(&s.db());
+    let app = app(settings(s.db(), None));
+    let now = unix_millis_now();
+    let range = format!("from_ms={}&to_ms={}", now - 700_000, now + 1);
+
+    let (code, csv, headers) = raw(&app, &format!("/api/export/history?{range}")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/csv")
+    );
+    assert!(
+        headers["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("winperf-history.csv")
+    );
+    let lines: Vec<&str> = csv.trim_end().split("\r\n").collect();
+    assert_eq!(lines.len(), 121, "a header and one row per sample");
+    assert!(lines[0].starts_with("time_utc_ms,cpu_percent,"));
+    let first: Vec<&str> = lines[1].split(',').collect();
+    assert_eq!(first.len(), 13);
+    assert_eq!(first[1], "20", "cpu as stored");
+    assert_eq!(first[6], "", "never measured is empty, not zero");
+    // Oldest first.
+    let times: Vec<i64> = lines[1..]
+        .iter()
+        .map(|l| l.split(',').next().unwrap().parse().unwrap())
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] < w[1]));
+
+    let (_, json, headers) = raw(&app, &format!("/api/export/history?format=json&{range}")).await;
+    assert_eq!(headers["content-type"], "application/json");
+    let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 120);
+    assert_eq!(rows[0]["cpu_percent"], 20.0);
+    assert!(rows[0]["disk_latency_ms"].is_null());
+    assert_eq!(rows[0]["time_utc_ms"], times[0]);
+
+    // An empty range is still a valid document.
+    let (_, empty, _) = raw(&app, "/api/export/history?format=json&from_ms=1&to_ms=2").await;
+    assert_eq!(empty, "[]");
+    let (code, _, _) = raw(&app, "/api/export/history?format=xml").await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let (code, _, _) = raw(&app, "/api/export/secrets").await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn exported_text_cannot_run_as_a_spreadsheet_formula() {
+    let s = Scratch::new();
+    seed(&s.db());
+    let db = Database::open(&s.db()).unwrap();
+    let now = unix_millis_now();
+    let mut nasty = event(now - 30_000, 42, Severity::Warning);
+    nasty.process_name = "=cmd|' /C calc'!A0".into();
+    nasty.exe_path = "@SUM(1+1),\"x\"".into();
+    nasty.explanation = "-2+3 then\nnew line".into();
+    db.insert_anomaly(&nasty).unwrap();
+    drop(db);
+    let app = app(settings(s.db(), None));
+    let (_, csv, _) = raw(&app, "/api/export/anomalies?hours=24").await;
+    assert!(csv.contains("'=cmd|' /C calc'!A0"), "{csv}");
+    assert!(csv.contains("\"'@SUM(1+1),\"\"x\"\"\""), "{csv}");
+    assert!(csv.contains("\"'-2+3 then\nnew line\""), "{csv}");
+    // No cell of any line starts with a bare formula character.
+    let (_, json, _) = raw(&app, "/api/export/anomalies?format=json").await;
+    let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let names: Vec<&str> = back
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["process"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"=cmd|' /C calc'!A0"),
+        "JSON keeps the real text"
+    );
+}
+
+#[tokio::test]
+async fn rankings_export_matches_the_ranking_api() {
+    let s = Scratch::new();
+    seed(&s.db());
+    let app = app(settings(s.db(), None));
+    let now = unix_millis_now();
+    let range = format!("from_ms={}&to_ms={}", now - 700_000, now + 1);
+    let (_, api_rows) = local(&app, &format!("/api/rankings?metric=cpu&{range}")).await;
+    let (_, csv, _) = raw(&app, &format!("/api/export/rankings?metric=cpu&{range}")).await;
+    let lines: Vec<&str> = csv.trim_end().split("\r\n").collect();
+    assert_eq!(lines[0], "rank,name,application,current,average,peak");
+    let want = api_rows["rows"].as_array().unwrap();
+    assert_eq!(lines.len(), want.len() + 1);
+    assert!(lines[1].starts_with(&format!("1,{},", want[0]["name"].as_str().unwrap())));
+    let (code, _, _) = raw(&app, "/api/export/rankings?metric=gpu").await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+}

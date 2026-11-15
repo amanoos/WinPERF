@@ -4,6 +4,7 @@
 //! no requests to anything else, and tells the browser not to load anything from elsewhere.
 
 pub mod api;
+pub mod export;
 pub mod guard;
 
 use axum::Router;
@@ -97,6 +98,7 @@ pub fn app(settings: ReportSettings) -> Router {
         .route("/api/system", get(api::system))
         .route("/api/rankings", get(api::rankings))
         .route("/api/subjects/{scope}/{id}", get(api::subject))
+        .route("/api/export/{kind}", get(export::export))
         .route("/api/anomalies", get(api::anomalies))
         .route("/api/anomalies/{id}", get(api::anomaly))
         .layer(axum::middleware::from_fn_with_state(

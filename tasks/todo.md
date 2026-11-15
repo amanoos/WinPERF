@@ -259,7 +259,11 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - AC: filters severity/app/resource; shows detail with explanation text and concurrent system metrics (FR-027 example layout); timeline chart.
   - Verify: seeded anomalies filter correctly; explanation text matches stored description.
   - Deps: T30, T21.
-- [ ] **T32: CSV/JSON export** (S)
+- [x] **T32: CSV/JSON export** (S)
+  - Done. `GET /api/export/{history|anomalies|rankings}?format=csv|json&from_ms&to_ms` (rankings also `metric`, `group`, `limit`), served as a download (`Content-Disposition: attachment`). The system history is streamed: a blocking reader sends 500-row chunks over a 4-chunk channel, so a long range never sits in memory and a closed download stops the read (`Database::system_samples_each`). CSV: header row, CRLF, never-measured is an empty cell (not zero), text starting with `=`, `+`, `-`, `@`, tab or CR gets a leading apostrophe, quoting per RFC 4180; numbers are left alone. JSON keeps the real text (an array of objects, empty range is `[]`). Dashboard has a Download section (history, anomalies, one ranking by metric) whose links follow the range, grouping and token.
+  - Verified: unit tests for the escaping and chunk joining; API tests (history rows equal samples, oldest first, empty cells for unmeasured, JSON round trip, empty range, bad format and kind refused, formula-injection strings in an anomaly's process, path and explanation, rankings export equals the ranking API); on the real database: 3,234 history rows in 0.24 s (621 KB CSV, 1.5 MB JSON), the same count as the status page, and the page's links set per range.
+  - Limits: anomalies and rankings are built in memory (at most 10,000 and 1,000 rows); an error part-way through a history stream ends the file early without a marker; raw system samples are kept 2 days by default, so longer ranges wait for rollups (T34).
+  - (Original AC below.)
   - AC: export rankings, history range, anomalies; large ranges streamed; command-line-injection-safe CSV (escape leading `=+-@`).
   - Verify: export round-trips; formula-injection test.
   - Deps: T31.

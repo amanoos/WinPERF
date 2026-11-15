@@ -215,6 +215,22 @@ impl Database {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<StoredSystemSample>> {
+        let mut out = Vec::new();
+        self.system_samples_each(from_ms, to_ms, |s| {
+            out.push(s);
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// Hand each system sample of the range to `each`, oldest first, without holding them all in
+    /// memory. `each` returns false to stop early (a closed download, say).
+    pub fn system_samples_each(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        mut each: impl FnMut(StoredSystemSample) -> bool,
+    ) -> Result<()> {
         let mut stmt = self.conn().prepare(
             "SELECT ts_ms, cpu_percent, memory_total_bytes, memory_available_bytes, \
              commit_used_bytes, commit_limit_bytes, disk_utilization_percent, disk_queue_length, \
@@ -223,8 +239,9 @@ impl Database {
              WHERE ts_ms BETWEEN ?1 AND ?2 ORDER BY ts_ms, id",
         )?;
         let big = |v: Option<i64>| v.map(|x| x as u64);
-        let rows = stmt.query_map([from_ms, to_ms], |r| {
-            Ok(StoredSystemSample {
+        let mut rows = stmt.query([from_ms, to_ms])?;
+        while let Some(r) = rows.next()? {
+            let sample = StoredSystemSample {
                 ts_ms: r.get(0)?,
                 cpu_percent: r.get(1)?,
                 memory_total_bytes: big(r.get(2)?),
@@ -238,9 +255,12 @@ impl Database {
                 disk_latency_ms: r.get(10)?,
                 net_rx_bytes_per_sec: r.get(11)?,
                 net_tx_bytes_per_sec: r.get(12)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            };
+            if !each(sample) {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 

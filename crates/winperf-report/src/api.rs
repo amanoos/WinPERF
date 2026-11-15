@@ -22,7 +22,7 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 const MAX_RANGE_MS: i64 = 400 * DAY_MS;
 
 /// An error the browser can read: a status and one sentence.
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -30,14 +30,14 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn bad(message: impl Into<String>) -> ApiError {
+pub(crate) fn bad(message: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.into())
 }
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
 /// Run `work` against a read-only connection on a blocking thread.
-async fn with_db<T, F>(shared: &Shared, work: F) -> Result<T, ApiError>
+pub(crate) async fn with_db<T, F>(shared: &Shared, work: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T, ApiError> + Send + 'static,
@@ -67,7 +67,7 @@ where
     })?
 }
 
-fn read_err(_: impl std::fmt::Debug) -> ApiError {
+pub(crate) fn read_err(_: impl std::fmt::Debug) -> ApiError {
     ApiError(
         StatusCode::INTERNAL_SERVER_ERROR,
         "the database could not be read".into(),
