@@ -3,6 +3,9 @@
 
 use crate::tui::anomalies::{AnomalySource, AnomalyView};
 use crate::tui::baselines::{BaselineSource, BaselineView, Nav};
+use crate::tui::history::{HistorySource, HistoryView};
+use crate::tui::inventory::{InventorySource, InventoryView};
+use crate::tui::settings::{SettingsSource, SettingsView};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -22,6 +25,9 @@ pub enum View {
     Processes,
     Baselines,
     Anomalies,
+    Inventory,
+    History,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +155,9 @@ pub struct App {
     pub view: View,
     pub baselines: BaselineView,
     pub anomalies: AnomalyView,
+    pub inventory: InventoryView,
+    pub history: HistoryView,
+    pub settings: SettingsView,
 }
 
 impl App {
@@ -170,6 +179,9 @@ impl App {
             view: View::Processes,
             baselines: BaselineView::new(None),
             anomalies: AnomalyView::new(None),
+            inventory: InventoryView::new(None),
+            history: HistoryView::new(None),
+            settings: SettingsView::new(None),
         }
     }
 
@@ -180,6 +192,52 @@ impl App {
             self.view = View::Baselines;
         }
         self
+    }
+
+    /// Give the Software Inventory a database to read, optionally opening on it.
+    pub fn with_inventory(mut self, source: InventorySource, open: bool) -> Self {
+        self.inventory = InventoryView::new(Some(source));
+        if open {
+            self.view = View::Inventory;
+        }
+        self
+    }
+
+    /// Give System History a database to read, optionally opening on it.
+    pub fn with_history(mut self, source: HistorySource, open: bool) -> Self {
+        self.history = HistoryView::new(Some(source));
+        if open {
+            self.view = View::History;
+        }
+        self
+    }
+
+    /// Give the Configuration screen the file and settings to edit, optionally opening on it.
+    pub fn with_settings(mut self, source: SettingsSource, open: bool) -> Self {
+        self.settings = SettingsView::new(Some(source));
+        if open {
+            self.view = View::Settings;
+        }
+        self
+    }
+
+    /// Re-read whatever the visible database-backed screen shows, if it is old. Returns whether
+    /// the screen changed.
+    pub fn refresh_screens_if_due(&mut self) -> bool {
+        match self.view {
+            View::Inventory => self.inventory.refresh_if_due(),
+            View::History => self.history.refresh_if_due(),
+            _ => false,
+        }
+    }
+
+    /// Use a configuration that was just saved: the Baseline Explorer takes the new windows and
+    /// confidence levels at once.
+    pub fn apply_config(&mut self, config: &winperf_core::config::Config) {
+        self.baselines.apply_config(
+            config.baseline.windows_hours.clone(),
+            config.baseline.confidence.clone(),
+        );
     }
 
     /// Give the Anomaly Explorer (and the dashboard's anomaly badge) a database to read,
@@ -336,6 +394,17 @@ impl App {
             }
             return;
         }
+        if self.view == View::Inventory {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.inventory.scroll(-3),
+                MouseEventKind::ScrollDown => self.inventory.scroll(3),
+                _ => {}
+            }
+            return;
+        }
+        if matches!(self.view, View::History | View::Settings) {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if mouse.row == self.header_y {
@@ -382,8 +451,44 @@ impl App {
             }
             return;
         }
+        if self.view == View::Inventory {
+            match self.inventory.on_key(key) {
+                Nav::Back => self.view = View::Processes,
+                Nav::Quit => self.should_quit = true,
+                Nav::Stay => {}
+            }
+            return;
+        }
+        if self.view == View::History {
+            match self.history.on_key(key) {
+                Nav::Back => self.view = View::Processes,
+                Nav::Quit => self.should_quit = true,
+                Nav::Stay => {}
+            }
+            return;
+        }
+        if self.view == View::Settings {
+            match self.settings.on_key(key) {
+                Nav::Back => self.view = View::Processes,
+                Nav::Quit => self.should_quit = true,
+                Nav::Stay => {}
+            }
+            if let Some(saved) = self.settings.take_saved() {
+                self.apply_config(&saved);
+            }
+            return;
+        }
         let page = self.page_size.max(1) as isize;
         match (key.code, key.modifiers) {
+            (KeyCode::Char('w'), _) => {
+                self.view = View::Inventory;
+                self.inventory.mark_stale();
+            }
+            (KeyCode::Char('h'), _) => {
+                self.view = View::History;
+                self.history.mark_stale();
+            }
+            (KeyCode::Char('s'), _) => self.view = View::Settings,
             (KeyCode::Char('e'), _) => {
                 self.view = View::Anomalies;
                 self.anomalies.mark_stale();
@@ -875,5 +980,111 @@ pub(crate) mod tests {
         let screen = drawn(&mut a).join("\n");
         assert!(screen.contains("1 active"), "{screen}");
         assert!(!screen.contains("new anomal"), "{screen}");
+    }
+
+    // ---- software, history, settings -----------------------------------------------------
+
+    #[test]
+    fn w_h_and_s_open_the_new_screens_and_escape_returns_without_quitting() {
+        for (opener, view) in [
+            ('w', View::Inventory),
+            ('h', View::History),
+            ('s', View::Settings),
+        ] {
+            let mut a = app();
+            a.on_key(ch(opener));
+            assert_eq!(a.view, view);
+            a.on_key(key(KeyCode::Esc));
+            assert_eq!(a.view, View::Processes, "{opener}");
+            assert!(!a.should_quit);
+            a.on_key(ch(opener));
+            a.on_key(ch('q'));
+            assert!(a.should_quit, "q quits from {view:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_screens_are_drawn_from_the_app() {
+        for (opener, expected) in [
+            ('w', "Software"),
+            ('h', "System history"),
+            ('s', "Configuration"),
+        ] {
+            let mut a = app();
+            a.on_key(ch(opener));
+            let screen = drawn(&mut a).join("\n");
+            assert!(screen.contains(expected), "{opener}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn the_dashboard_title_lists_the_screens() {
+        let mut a = app();
+        let screen = drawn(&mut a).join("\n");
+        for hint in [
+            "e anomalies",
+            "b baselines",
+            "w software",
+            "h history",
+            "s settings",
+        ] {
+            assert!(screen.contains(hint), "{hint} in\n{screen}");
+        }
+    }
+
+    #[test]
+    fn saving_the_settings_applies_the_baseline_windows_to_the_explorer_at_once() {
+        use crate::tui::baselines::BaselineSource;
+        use crate::tui::settings::{Field, SettingsSource};
+        let dir = std::env::temp_dir().join(format!("winperf-app-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let config = winperf_core::config::Config::default();
+        let mut a = app()
+            .with_baselines(
+                BaselineSource {
+                    db_path: dir.join("none.db"),
+                    windows: config.baseline.windows_hours.clone(),
+                    confidence: config.baseline.confidence.clone(),
+                },
+                false,
+            )
+            .with_settings(
+                SettingsSource {
+                    path: path.clone(),
+                    config,
+                },
+                true,
+            );
+        assert_eq!(
+            a.baselines.window_hours(),
+            Some(168),
+            "starts on the longest"
+        );
+
+        // Go to the windows setting, replace the list and save.
+        while a.settings.field() != Field::Windows {
+            a.on_key(ch('j'));
+        }
+        a.on_key(key(KeyCode::Enter));
+        for _ in 0..12 {
+            a.on_key(key(KeyCode::Backspace));
+        }
+        for c in "1, 12".chars() {
+            a.on_key(ch(c));
+        }
+        a.on_key(key(KeyCode::Enter));
+        a.on_key(ch('w'));
+
+        assert_eq!(
+            a.baselines.window_hours(),
+            Some(12),
+            "the new longest window"
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("windows_hours = [1, 12]"), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

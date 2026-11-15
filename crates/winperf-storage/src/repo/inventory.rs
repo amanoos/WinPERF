@@ -357,6 +357,41 @@ pub(crate) fn upsert_instance(
     )?)
 }
 
+/// An executable the monitor has seen, with how many of its processes are running right now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutableRow {
+    pub file_name: String,
+    pub file_path: String,
+    pub product_name: Option<String>,
+    /// The signer's name when the signature is valid.
+    pub signer: Option<String>,
+    pub classification: Classification,
+    pub running_instances: u32,
+}
+
+impl Database {
+    /// Every executable seen so far, with its running instance count, ordered by name.
+    pub fn list_executables(&self) -> Result<Vec<ExecutableRow>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT e.file_name, e.file_path, e.product_name, e.signer, e.classification,                     (SELECT COUNT(*) FROM process_instances pi                      WHERE pi.executable_id = e.id AND pi.end_time IS NULL) AS running              FROM executables e ORDER BY e.file_name COLLATE NOCASE, e.file_path",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let class: String = r.get(4)?;
+            out.push(ExecutableRow {
+                file_name: r.get(0)?,
+                file_path: r.get(1)?,
+                product_name: r.get(2)?,
+                signer: r.get(3)?,
+                classification: parse_classification(&class)?,
+                running_instances: r.get::<_, i64>(5)?.max(0) as u32,
+            });
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +681,42 @@ mod tests {
         }
         let db = Database::open(&path).unwrap();
         assert_eq!(db.load_installed_apps().unwrap(), apps);
+    }
+
+    #[test]
+    fn executables_are_listed_with_their_running_instance_counts() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO executables (id, path_key, file_path, file_name, product_name,
+                   signature_status, signer, classification, file_size, file_mtime_ns, verified_at)
+                 VALUES (1, 'c:/b/zed.exe', 'C:/B/Zed.exe', 'Zed.exe', 'Zed', 'valid',
+                         'Zed Ltd', 'third_party', 1, 1, 't'),
+                        (2, 'c:/a/alpha.exe', 'C:/A/alpha.exe', 'alpha.exe', NULL,
+                         'not_signed', NULL, 'unsigned', 1, 1, 't');
+                 INSERT INTO process_instances (pid, start_time, parent_pid, name, executable_id,
+                   first_seen, last_seen, end_time) VALUES
+                   (1, 1, 0, 'Zed.exe', 1, 't', 't', NULL),
+                   (2, 2, 0, 'Zed.exe', 1, 't', 't', NULL),
+                   (3, 3, 0, 'Zed.exe', 1, 't', 't', 'ended'),
+                   (4, 4, 0, 'alpha.exe', 2, 't', 't', 'ended');",
+            )
+            .unwrap();
+        let rows = db.list_executables().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].file_name, "alpha.exe",
+            "ordered by name, case-insensitively"
+        );
+        assert_eq!(rows[0].classification, Classification::Unsigned);
+        assert_eq!(
+            (rows[0].running_instances, rows[0].signer.clone()),
+            (0, None)
+        );
+        assert_eq!(rows[1].file_name, "Zed.exe");
+        assert_eq!(rows[1].running_instances, 2, "ended instances do not count");
+        assert_eq!(rows[1].signer.as_deref(), Some("Zed Ltd"));
+        assert_eq!(rows[1].product_name.as_deref(), Some("Zed"));
+        assert_eq!(rows[1].classification, Classification::ThirdPartyOfficial);
     }
 }

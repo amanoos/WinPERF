@@ -4,7 +4,7 @@ mod commands;
 mod export;
 mod tui;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use export::Format;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -117,6 +117,9 @@ enum Command {
         /// Open on the Anomaly Explorer instead of the process table (press e to switch)
         #[arg(long)]
         anomalies: bool,
+        /// Open on another screen (press the key shown in the title to switch)
+        #[arg(long, value_enum)]
+        screen: Option<Screen>,
         /// Instead of the interactive screen, sample twice and print one frame as text
         #[arg(long)]
         snapshot: bool,
@@ -127,6 +130,17 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         height: u16,
     },
+}
+
+/// Screens `winperf tui --screen` can open on, besides the process table.
+#[derive(Clone, Copy, ValueEnum)]
+enum Screen {
+    /// Installed and running software by publisher class
+    Software,
+    /// CPU, memory, disk and network graphs
+    History,
+    /// View and change the settings
+    Settings,
 }
 
 #[derive(Subcommand)]
@@ -497,11 +511,22 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             no_mouse,
             baselines,
             anomalies,
+            screen,
             snapshot,
             width,
             height,
         } => {
             let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let inventory_source = tui::inventory::InventorySource {
+                db_path: db_path.clone(),
+            };
+            let history_source = tui::history::HistorySource {
+                db_path: db_path.clone(),
+            };
+            let settings_source = tui::settings::SettingsSource {
+                path: resolve_config_location(cli.config.clone()).path,
+                config: config.clone(),
+            };
             let anomaly_source = tui::anomalies::AnomalySource {
                 db_path: db_path.clone(),
             };
@@ -531,7 +556,10 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             let feed = tui::Feed::spawn(make, interval);
             let app = tui::app::App::new(interval, NetworkStatus::RequiresAdmin)
                 .with_baselines(source, baselines)
-                .with_anomalies(anomaly_source, anomalies && !baselines);
+                .with_anomalies(anomaly_source, anomalies && !baselines)
+                .with_inventory(inventory_source, matches!(screen, Some(Screen::Software)))
+                .with_history(history_source, matches!(screen, Some(Screen::History)))
+                .with_settings(settings_source, matches!(screen, Some(Screen::Settings)));
             if snapshot {
                 let text = tui::snapshot(&feed, app, 2, width, height).map_err(io)?;
                 print!("{text}");

@@ -7,6 +7,9 @@
 pub mod anomalies;
 pub mod app;
 pub mod baselines;
+pub mod history;
+pub mod inventory;
+pub mod settings;
 pub mod ui;
 
 use app::App;
@@ -172,6 +175,9 @@ fn event_loop(
         if app.refresh_anomalies_if_due() {
             dirty = true;
         }
+        if app.refresh_screens_if_due() {
+            dirty = true;
+        }
     }
     Ok(())
 }
@@ -208,6 +214,7 @@ pub fn snapshot(
     }
     app.refresh_baselines_if_due();
     app.refresh_anomalies_if_due();
+    app.refresh_screens_if_due();
     // The in-memory backend cannot fail (its error type is `Infallible`).
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
     terminal

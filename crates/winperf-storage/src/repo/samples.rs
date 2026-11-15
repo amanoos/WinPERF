@@ -171,14 +171,24 @@ impl Database {
 
     /// All system-wide samples, oldest first.
     pub fn system_samples(&self) -> Result<Vec<StoredSystemSample>> {
+        self.system_samples_between(i64::MIN, i64::MAX)
+    }
+
+    /// System-wide samples with `from_ms <= ts_ms <= to_ms`, oldest first.
+    pub fn system_samples_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<StoredSystemSample>> {
         let mut stmt = self.conn().prepare(
             "SELECT ts_ms, cpu_percent, memory_total_bytes, memory_available_bytes, \
              commit_used_bytes, commit_limit_bytes, disk_utilization_percent, disk_queue_length, \
              disk_read_bytes_per_sec, disk_write_bytes_per_sec, disk_latency_ms, \
-             net_rx_bytes_per_sec, net_tx_bytes_per_sec FROM system_samples ORDER BY ts_ms, id",
+             net_rx_bytes_per_sec, net_tx_bytes_per_sec FROM system_samples \
+             WHERE ts_ms BETWEEN ?1 AND ?2 ORDER BY ts_ms, id",
         )?;
         let big = |v: Option<i64>| v.map(|x| x as u64);
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([from_ms, to_ms], |r| {
             Ok(StoredSystemSample {
                 ts_ms: r.get(0)?,
                 cpu_percent: r.get(1)?,
@@ -196,5 +206,33 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_samples_can_be_read_for_a_time_range() {
+        let db = Database::open_in_memory().unwrap();
+        for ts in [1_000, 2_000, 3_000, 4_000] {
+            db.conn()
+                .execute(
+                    "INSERT INTO system_samples (ts_ms, cpu_percent) VALUES (?1, ?2)",
+                    rusqlite::params![ts, ts as f64 / 100.0],
+                )
+                .unwrap();
+        }
+        let ts = |rows: Vec<StoredSystemSample>| rows.iter().map(|r| r.ts_ms).collect::<Vec<_>>();
+        assert_eq!(
+            ts(db.system_samples_between(2_000, 3_000).unwrap()),
+            vec![2_000, 3_000]
+        );
+        assert_eq!(
+            ts(db.system_samples_between(5_000, 9_000).unwrap()),
+            Vec::<i64>::new()
+        );
+        assert_eq!(db.system_samples().unwrap().len(), 4);
     }
 }

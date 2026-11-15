@@ -9,6 +9,6 @@ pub mod samples;
 
 pub use anomalies::{AnomalyFilter, StoredAnomaly};
 pub use baselines::{ListedBaseline, RecomputeReport, StoredBaseline};
-pub use inventory::FileIdentity;
+pub use inventory::{ExecutableRow, FileIdentity};
 pub use profile::ProfileState;
 pub use samples::{StoredSample, StoredSystemSample};

@@ -97,6 +97,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         super::anomalies::draw(f, area, &mut app.anomalies);
         return;
     }
+    if app.view == View::Inventory {
+        super::inventory::draw(f, area, &mut app.inventory);
+        return;
+    }
+    if app.view == View::History {
+        super::history::draw(f, area, &mut app.history);
+        return;
+    }
+    if app.view == View::Settings {
+        super::settings::draw(f, area, &mut app.settings);
+        return;
+    }
     let [title, system, table, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(8),
@@ -129,12 +141,9 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Yellow),
         ));
     }
-    spans.push(Span::raw(format!(
-        "System overview - sampling every {}s",
-        app.interval.as_secs()
-    )));
+    spans.push(Span::raw(format!("Overview ({}s)", app.interval.as_secs())));
     spans.push(Span::styled(
-        "   e: anomalies  b: baselines",
+        "  e anomalies  b baselines  w software  h history  s settings",
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -647,7 +656,7 @@ mod tests {
         a.network = NetworkStatus::Active;
         let on = render(&mut a, 80, 24).join("\n");
         assert!(on.contains("net: per-process"), "{on}");
-        assert!(on.contains("sampling every 2s"), "{on}");
+        assert!(on.contains("Overview (2s)"), "{on}");
     }
 
     // ---- sorting by column: keyboard and mouse ------------------------------------------

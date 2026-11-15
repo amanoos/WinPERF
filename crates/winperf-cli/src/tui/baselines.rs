@@ -81,6 +81,22 @@ impl BaselineView {
         self.stale = true;
     }
 
+    /// Use new baseline windows and confidence levels (the configuration was changed). Stays on
+    /// the same window when it still exists, else the longest.
+    pub fn apply_config(&mut self, windows: Vec<u32>, confidence: ConfidenceConfig) {
+        let Some(source) = &mut self.source else {
+            return;
+        };
+        let current = source.windows.get(self.window).copied();
+        source.windows = windows;
+        source.confidence = confidence;
+        self.window = current
+            .and_then(|h| source.windows.iter().position(|w| *w == h))
+            .unwrap_or(source.windows.len().saturating_sub(1));
+        self.table.select(None);
+        self.stale = true;
+    }
+
     /// Re-read the database if asked to or if the data is old. Returns whether anything changed
     /// on screen, so the caller knows to redraw.
     pub fn refresh_if_due(&mut self) -> bool {

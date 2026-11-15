@@ -3,6 +3,7 @@
 pub mod anomaly;
 pub mod classification;
 pub mod config;
+pub mod config_edit;
 pub mod engine;
 pub mod inventory;
 pub mod metric;
