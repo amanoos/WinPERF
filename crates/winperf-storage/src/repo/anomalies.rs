@@ -3,9 +3,9 @@
 use crate::db::Database;
 use crate::error::{Result, StorageError};
 use rusqlite::{OptionalExtension, params};
-use std::collections::HashMap;
-use winperf_core::anomaly::{AnomalyEvent, BaselineStats, Severity};
+use winperf_core::anomaly::{AnomalyEvent, AnomalyKind, BaselineSet, BaselineStats, Severity};
 use winperf_core::config::{ConfidenceConfig, Resource};
+use winperf_core::profiler::baseline::BaselineMetric;
 use winperf_core::profiler::confidence::assess;
 
 /// One stored anomaly event, as read back.
@@ -19,6 +19,7 @@ pub struct StoredAnomaly {
     pub application: Option<String>,
     pub exe_path: String,
     pub resource: Resource,
+    pub kind: AnomalyKind,
     pub current: f64,
     pub baseline: f64,
     pub deviation_pct: f64,
@@ -34,7 +35,7 @@ pub struct StoredAnomaly {
 const COLUMNS: &str = "id, detected_ts_ms, process_instance_id, pid, process_name, application, \
                        exe_path, resource, current_value, baseline_value, deviation_pct, \
                        duration_ms, severity, system_cpu_percent, system_memory_percent, \
-                       baseline_window_hours, baseline_confidence, explanation";
+                       baseline_window_hours, baseline_confidence, explanation, kind";
 
 fn from_row(r: &rusqlite::Row<'_>) -> Result<StoredAnomaly> {
     let resource: String = r.get(7)?;
@@ -60,6 +61,11 @@ fn from_row(r: &rusqlite::Row<'_>) -> Result<StoredAnomaly> {
         baseline_window_hours: r.get(15)?,
         baseline_confidence: r.get(16)?,
         explanation: r.get(17)?,
+        kind: {
+            let kind: String = r.get(18)?;
+            AnomalyKind::parse(&kind)
+                .ok_or_else(|| StorageError::Corrupt(format!("anomaly kind {kind:?}")))?
+        },
     })
 }
 
@@ -85,8 +91,9 @@ impl Database {
             "INSERT INTO anomaly_events (detected_ts_ms, process_instance_id, pid, process_name, \
              application, exe_path, resource, current_value, baseline_value, deviation_pct, \
              duration_ms, severity, system_cpu_percent, system_memory_percent, \
-             baseline_window_hours, baseline_confidence, explanation) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             baseline_window_hours, baseline_confidence, explanation, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18)",
             params![
                 e.detected_ts_ms,
                 instance_id,
@@ -105,6 +112,7 @@ impl Database {
                 e.baseline_window_hours,
                 e.baseline_confidence.label(),
                 e.explanation,
+                e.kind.as_str(),
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -141,45 +149,51 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM anomaly_events", [], |r| r.get(0))?)
     }
 
-    /// CPU baselines the detector may use, keyed by lower-cased executable path. Only the given
-    /// windows count, a subject takes its longest window whose confidence is above Insufficient,
-    /// and a subject with no such window is left out (so it is never judged).
-    pub fn usable_cpu_baselines(
+    /// The baselines the detectors may use. Only the given windows count, a subject takes its
+    /// longest window whose confidence is above Insufficient (separately for each metric), and a
+    /// subject with no such window is left out so it is never judged.
+    pub fn usable_baselines(
         &self,
         windows_hours: &[u32],
         confidence: &ConfidenceConfig,
-    ) -> Result<HashMap<String, BaselineStats>> {
+    ) -> Result<BaselineSet> {
         let mut stmt = self.conn().prepare(
-            "SELECT e.path_key, bp.window_hours, bp.observations, bp.first_ts_ms, bp.last_ts_ms, \
-                    bp.mean, bp.median, bp.mad, bp.p95 \
+            "SELECT e.path_key, bp.metric, bp.window_hours, bp.observations, bp.first_ts_ms, \
+                    bp.last_ts_ms, bp.mean, bp.median, bp.mad, bp.p95, bp.growth_per_hour \
              FROM baseline_profiles bp JOIN executables e ON e.id = bp.subject_id \
-             WHERE bp.scope = 'executable' AND bp.metric = 'cpu' \
+             WHERE bp.scope = 'executable' \
              ORDER BY bp.window_hours DESC",
         )?;
         let mut rows = stmt.query([])?;
-        let mut out: HashMap<String, BaselineStats> = HashMap::new();
+        let mut out = BaselineSet::new();
         while let Some(r) = rows.next()? {
-            let window_hours: u32 = r.get(1)?;
+            let window_hours: u32 = r.get(2)?;
             if !windows_hours.contains(&window_hours) {
                 continue;
             }
+            let metric: String = r.get(1)?;
+            let Some(metric) = BaselineMetric::parse(&metric) else {
+                continue;
+            };
             let path_key: String = r.get(0)?;
-            if out.contains_key(&path_key) {
+            if out.get(metric, &path_key).is_some() {
                 continue; // a longer window already qualified
             }
-            let observations = r.get::<_, i64>(2)?.max(0) as u64;
-            let span_ms = r.get::<_, i64>(4)? - r.get::<_, i64>(3)?;
+            let observations = r.get::<_, i64>(3)?.max(0) as u64;
+            let span_ms = r.get::<_, i64>(5)? - r.get::<_, i64>(4)?;
             let level = assess(observations, span_ms, confidence);
             if !level.is_usable() {
                 continue;
             }
             out.insert(
+                metric,
                 path_key,
                 BaselineStats {
-                    mean: r.get(5)?,
-                    median: r.get(6)?,
-                    mad: r.get(7)?,
-                    p95: r.get(8)?,
+                    mean: r.get(6)?,
+                    median: r.get(7)?,
+                    mad: r.get(8)?,
+                    p95: r.get(9)?,
+                    growth_per_hour: r.get(10)?,
                     confidence: level,
                     window_hours,
                 },
@@ -203,6 +217,7 @@ mod tests {
             process_name: "busy.exe".into(),
             exe_path: r"C:\apps\busy.exe".into(),
             resource: Resource::Cpu,
+            kind: AnomalyKind::Deviation,
             current: 72.0,
             baseline: 8.0,
             deviation_pct: 800.0,
@@ -230,6 +245,7 @@ mod tests {
         assert_eq!(back.process_name, "busy.exe");
         assert_eq!(back.exe_path, r"C:\apps\busy.exe");
         assert_eq!(back.resource, Resource::Cpu);
+        assert_eq!(back.kind, AnomalyKind::Deviation);
         assert_eq!((back.current, back.baseline), (72.0, 8.0));
         assert_eq!(back.deviation_pct, 800.0);
         assert_eq!(back.duration_ms, 120_000);
@@ -314,9 +330,9 @@ mod tests {
         add_baseline(&db, 1, 24, 5_000, 600, 8.0); // plenty of history
         add_baseline(&db, 2, 24, 10, 1, 8.0); // a few seconds' worth
 
-        let usable = db.usable_cpu_baselines(&[1, 24, 168], &cfg).unwrap();
-        assert_eq!(usable.len(), 1);
-        let b = &usable[r"c:\apps\old.exe"];
+        let usable = db.usable_baselines(&[1, 24, 168], &cfg).unwrap();
+        assert_eq!(usable.subjects(BaselineMetric::Cpu), 1);
+        let b = usable.get(BaselineMetric::Cpu, r"c:\apps\old.exe").unwrap();
         assert_eq!((b.median, b.window_hours), (8.0, 24));
         assert!(b.confidence.is_usable());
     }
@@ -330,9 +346,9 @@ mod tests {
         add_baseline(&db, 1, 24, 5_000, 600, 2.0);
         add_baseline(&db, 1, 168, 10, 1, 3.0); // longest, but too thin to trust
 
-        let usable = db.usable_cpu_baselines(&[1, 24, 168], &cfg).unwrap();
-        assert_eq!(usable[r"c:\apps\a.exe"].window_hours, 24);
-        assert_eq!(usable[r"c:\apps\a.exe"].median, 2.0);
+        let usable = db.usable_baselines(&[1, 24, 168], &cfg).unwrap();
+        let b = usable.get(BaselineMetric::Cpu, r"c:\apps\a.exe").unwrap();
+        assert_eq!((b.window_hours, b.median), (24, 2.0));
     }
 
     #[test]
@@ -341,8 +357,46 @@ mod tests {
         add_executable(&db, 1, r"C:\Apps\A.exe");
         add_baseline(&db, 1, 168, 5_000, 600, 3.0);
         let usable = db
-            .usable_cpu_baselines(&[1, 24], &ConfidenceConfig::default())
+            .usable_baselines(&[1, 24], &ConfidenceConfig::default())
             .unwrap();
         assert!(usable.is_empty(), "a stale 168 h row from an old config");
+    }
+
+    #[test]
+    fn every_metric_is_loaded_with_its_own_window_and_memory_growth() {
+        let db = Database::open_in_memory().unwrap();
+        add_executable(&db, 1, r"C:\Apps\A.exe");
+        for (metric, growth) in [
+            ("memory", Some(5.0e6)),
+            ("disk_write", None),
+            ("net_rx", None),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO baseline_profiles (scope, subject_id, window_hours, metric, \
+                     observations, first_ts_ms, last_ts_ms, mean, median, mad, stddev, p95, peak, \
+                     growth_per_hour, computed_at_ms) VALUES ('executable', 1, 24, ?1, 5000, 0, \
+                     36000000, 1.0, 1.0, 0.1, 0.1, 2.0, 3.0, ?2, 0)",
+                    params![metric, growth],
+                )
+                .unwrap();
+        }
+        let usable = db
+            .usable_baselines(&[24], &ConfidenceConfig::default())
+            .unwrap();
+        let key = r"c:\apps\a.exe";
+        assert_eq!(
+            usable
+                .get(BaselineMetric::Memory, key)
+                .unwrap()
+                .growth_per_hour,
+            Some(5.0e6)
+        );
+        assert!(usable.get(BaselineMetric::DiskWrite, key).is_some());
+        assert!(usable.get(BaselineMetric::NetRx, key).is_some());
+        assert!(
+            usable.get(BaselineMetric::Cpu, key).is_none(),
+            "no cpu row stored"
+        );
     }
 }

@@ -39,6 +39,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0008_anomaly_events",
         include_str!("../migrations/0008_anomaly_events.sql"),
     ),
+    (
+        "0009_anomaly_kind",
+        include_str!("../migrations/0009_anomaly_kind.sql"),
+    ),
 ];
 
 /// Highest schema version this build understands.

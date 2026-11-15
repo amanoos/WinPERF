@@ -1,6 +1,7 @@
 //! `winperf anomalies list|show`: the stored anomaly events (PRD FR-018, FR-019).
 
 use std::io::Write;
+use winperf_core::anomaly::{AnomalyKind, format};
 use winperf_core::config::Resource;
 use winperf_core::time::{format_span, unix_millis_to_utc_string};
 use winperf_storage::{Database, StoredAnomaly};
@@ -13,10 +14,15 @@ fn at(ms: i64) -> String {
     unix_millis_to_utc_string(ms).unwrap_or_else(|| "unknown time".into())
 }
 
-fn value(resource: Resource, v: f64) -> String {
-    match resource {
-        Resource::Cpu => format!("{v:.1}%"),
-        _ => format!("{v:.1}"),
+fn value(a: &StoredAnomaly, v: f64) -> String {
+    format::value(a.resource, a.kind, v)
+}
+
+/// What the event is about: the resource, or "memory growth" for a potential leak.
+fn what(a: &StoredAnomaly) -> &'static str {
+    match (a.resource, a.kind) {
+        (Resource::Memory, AnomalyKind::MemoryGrowth) => "mem-growth",
+        (r, _) => r.as_str(),
     }
 }
 
@@ -43,7 +49,7 @@ pub fn list(
     }
     writeln!(
         out,
-        "{:<5} {:<19} {:<13} {:<8} {:<28} {:>8} {:>8} {:>7} {:>8}",
+        "{:<5} {:<19} {:<13} {:<10} {:<28} {:>10} {:>10} {:>7} {:>8}",
         "ID", "TIME (UTC)", "SEVERITY", "RESOURCE", "PROCESS", "NOW", "NORMAL", "OVER", "LASTED"
     )?;
     for a in &rows {
@@ -66,14 +72,14 @@ fn format_row(a: &StoredAnomaly) -> String {
         process
     };
     format!(
-        "{:<5} {:<19} {:<13} {:<8} {:<28} {:>8} {:>8} {:>7} {:>8}",
+        "{:<5} {:<19} {:<13} {:<10} {:<28} {:>10} {:>10} {:>7} {:>8}",
         a.id,
         at(a.detected_ts_ms),
         a.severity.label(),
-        a.resource.as_str(),
+        what(a),
         process,
-        value(a.resource, a.current),
-        value(a.resource, a.baseline),
+        value(a, a.current),
+        value(a, a.baseline),
         deviation(a.deviation_pct),
         format_span(a.duration_ms),
     )
@@ -91,12 +97,16 @@ pub fn show(db: &Database, id: i64, out: &mut impl Write) -> Result {
         writeln!(out, "  Application  {app}")?;
     }
     writeln!(out, "  Path         {}", a.exe_path)?;
-    writeln!(out, "  Resource     {}", a.resource.as_str())?;
-    writeln!(out, "  Measured     {}", value(a.resource, a.current))?;
+    writeln!(out, "  Resource     {}", what(&a))?;
+    writeln!(out, "  Measured     {}", value(&a, a.current))?;
     writeln!(
         out,
-        "  Baseline     {} (median; {} h window, {} confidence)",
-        value(a.resource, a.baseline),
+        "  Baseline     {} ({}; {} h window, {} confidence)",
+        value(&a, a.baseline),
+        match a.kind {
+            AnomalyKind::Deviation => "median",
+            AnomalyKind::MemoryGrowth => "usual growth",
+        },
         a.baseline_window_hours,
         a.baseline_confidence
     )?;
@@ -129,6 +139,7 @@ mod tests {
             process_name: name.into(),
             exe_path: format!(r"C:\apps\{name}"),
             resource: Resource::Cpu,
+            kind: AnomalyKind::Deviation,
             current: 72.0,
             baseline: 8.0,
             deviation_pct: 800.0,
@@ -235,5 +246,36 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let err = show(&db, 99, &mut Vec::new()).unwrap_err();
         assert_eq!(err.to_string(), "no anomaly with id 99");
+    }
+
+    #[test]
+    fn a_potential_leak_is_shown_as_a_growth_rate_not_a_level() {
+        let db = Database::open_in_memory().unwrap();
+        let mib = 1024.0 * 1024.0;
+        db.insert_anomaly(&AnomalyEvent {
+            detected_ts_ms: 1_700_000_000_000,
+            pid: 9,
+            start_time: 1,
+            process_name: "leaky.exe".into(),
+            exe_path: r"C:pps\leaky.exe".into(),
+            resource: Resource::Memory,
+            kind: AnomalyKind::MemoryGrowth,
+            current: 180.0 * mib,
+            baseline: 0.0,
+            deviation_pct: 17_900.0,
+            duration_ms: 1_800_000,
+            severity: Severity::Warning,
+            system: SystemHealth::default(),
+            baseline_window_hours: 24,
+            baseline_confidence: Confidence::Established,
+            explanation: "Potential memory leak: leaky.exe".into(),
+        })
+        .unwrap();
+        let t = text(|o| list(&db, None, 50, 1_700_000_100_000, o));
+        assert!(t.contains("mem-growth") && t.contains("180.0 MiB/h"), "{t}");
+        let t = text(|o| show(&db, 1, o));
+        assert!(t.contains("Resource     mem-growth"), "{t}");
+        assert!(t.contains("0 B/h (usual growth; 24 h window"), "{t}");
+        assert!(t.contains("Potential memory leak"), "{t}");
     }
 }

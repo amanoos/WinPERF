@@ -11,7 +11,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use winperf_core::config::{Config, Resource};
+use winperf_core::anomaly::Sensitivities;
+use winperf_core::config::Config;
 use winperf_core::inventory::{
     BackgroundClassifier, CachedVerifier, ExecutableClassifier, SignatureVerifier, discover,
 };
@@ -343,7 +344,7 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 Arc::clone(&stop),
             );
             let detect = DetectSettings::new(
-                config.detection.for_resource(Resource::Cpu),
+                Sensitivities::from_config(&config.detection),
                 config.baseline.windows_hours.clone(),
                 config.baseline.confidence.clone(),
             );

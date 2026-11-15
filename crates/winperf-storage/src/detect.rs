@@ -12,14 +12,14 @@ use crate::db::Database;
 use crate::error::StorageError;
 use crate::sink::DbSink;
 use std::time::Duration;
-use winperf_core::anomaly::rules::CpuRule;
+use winperf_core::anomaly::Sensitivities;
 use winperf_core::anomaly::tracker::AnomalyTracker;
-use winperf_core::config::{ConfidenceConfig, Sensitivity};
+use winperf_core::config::ConfidenceConfig;
 use winperf_core::engine::{SampleSink, TickBatch};
 
 #[derive(Debug, Clone)]
 pub struct DetectSettings {
-    pub cpu_sensitivity: Sensitivity,
+    pub sensitivities: Sensitivities,
     /// The baseline windows to trust, in hours (from `[baseline] windows_hours`).
     pub windows_hours: Vec<u32>,
     pub confidence: ConfidenceConfig,
@@ -31,12 +31,12 @@ impl DetectSettings {
     pub const DEFAULT_REFRESH: Duration = Duration::from_secs(300);
 
     pub fn new(
-        cpu_sensitivity: Sensitivity,
+        sensitivities: Sensitivities,
         windows_hours: Vec<u32>,
         confidence: ConfidenceConfig,
     ) -> Self {
         Self {
-            cpu_sensitivity,
+            sensitivities,
             windows_hours,
             confidence,
             refresh: Self::DEFAULT_REFRESH,
@@ -55,7 +55,7 @@ pub struct DetectingSink {
 
 impl DetectingSink {
     pub fn new(inner: DbSink, settings: DetectSettings) -> Self {
-        let tracker = AnomalyTracker::new(CpuRule::for_sensitivity(settings.cpu_sensitivity));
+        let tracker = AnomalyTracker::new(settings.sensitivities);
         Self {
             inner,
             tracker,
@@ -104,7 +104,7 @@ impl DetectingSink {
             Ok(state) => self.tracker.set_enabled(!state.active),
             Err(e) => self.last_error = Some(format!("reading profiling state: {e}")),
         }
-        match db.usable_cpu_baselines(&self.settings.windows_hours, &self.settings.confidence) {
+        match db.usable_baselines(&self.settings.windows_hours, &self.settings.confidence) {
             Ok(baselines) => self.tracker.set_baselines(baselines),
             Err(e) => self.last_error = Some(format!("reading baselines: {e}")),
         }
@@ -140,6 +140,7 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use std::collections::VecDeque;
+    use winperf_core::config::Sensitivity;
     use winperf_core::engine::{Engine, MetricsSource};
     use winperf_core::inventory::RawProcess;
     use winperf_core::sampling::Observation;
@@ -210,7 +211,7 @@ mod tests {
 
     fn run(db: Database, script: Script, ticks: i64) -> DetectingSink {
         let settings = DetectSettings::new(
-            Sensitivity::Normal,
+            Sensitivities::uniform(Sensitivity::Normal),
             vec![1, 24, 168],
             ConfidenceConfig::default(),
         );
@@ -282,5 +283,55 @@ mod tests {
         db.start_profiling(1).unwrap();
         let sink = run(db, burner(10, 90), 10);
         assert_eq!(sink.database().sample_count().unwrap(), 10);
+    }
+
+    /// A process whose private memory climbs 3 MiB a minute for 40 minutes (5 s ticks).
+    fn leaker() -> Script {
+        Script(
+            (0..480u64)
+                .map(|i| {
+                    vec![Observation {
+                        pid: 7,
+                        name: "busy.exe".into(),
+                        start_time: Some(100),
+                        cpu_time_100ns: Some(0),
+                        working_set: Some(100 * 1024 * 1024),
+                        private_bytes: Some(200 * 1024 * 1024 + i * 262_144), // 3 MiB/min
+                        ..Default::default()
+                    }]
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_steadily_growing_process_is_stored_as_a_potential_leak() {
+        let db = database_with_baseline(5_000, 600);
+        db.conn()
+            .execute(
+                "INSERT INTO baseline_profiles (scope, subject_id, window_hours, metric,                  observations, first_ts_ms, last_ts_ms, mean, median, mad, stddev, p95, peak,                  growth_per_hour, computed_at_ms) VALUES ('executable', 1, 24, 'memory', 5000,                  0, 36000000, 1.0e8, 1.0e8, 1.0e6, 1.0e6, 1.1e8, 1.2e8, 0.0, 0)",
+                [],
+            )
+            .unwrap();
+        let sink = run(db, leaker(), 480);
+
+        let events = sink.database().list_anomalies(None, 10).unwrap();
+        assert_eq!(events.len(), 1, "{events:#?}");
+        let e = &events[0];
+        assert_eq!(e.kind, winperf_core::anomaly::AnomalyKind::MemoryGrowth);
+        assert_eq!(e.resource, winperf_core::config::Resource::Memory);
+        assert!(
+            (e.current / (1024.0 * 1024.0) - 180.0).abs() < 5.0,
+            "{}",
+            e.current
+        );
+        assert!(e.explanation.contains("Potential memory leak"));
+    }
+
+    #[test]
+    fn without_a_memory_baseline_growth_is_not_judged() {
+        let db = database_with_baseline(5_000, 600); // CPU baseline only
+        let sink = run(db, leaker(), 480);
+        assert_eq!(sink.raised(), 0);
     }
 }
