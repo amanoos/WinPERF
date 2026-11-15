@@ -85,6 +85,11 @@ enum Command {
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
         top: u32,
     },
+    /// The background Windows service (install, remove, start, stop, status)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Show or create the configuration file
     Config {
         #[command(subcommand)]
@@ -136,6 +141,30 @@ enum Screen {
     History,
     /// View and change the settings
     Settings,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the service (or update it); needs an elevated prompt
+    Install {
+        /// Path of winperf-service.exe (default: next to this program)
+        #[arg(long)]
+        exe: Option<PathBuf>,
+        /// Start shortly after boot rather than with the other services
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+        delayed_start: bool,
+        /// Do not start the service right away
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Stop and remove the service; the database is kept
+    Uninstall,
+    /// Start the installed service
+    Start,
+    /// Stop the installed service
+    Stop,
+    /// Show whether the service is installed and running
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -285,6 +314,30 @@ fn run_config(action: &ConfigAction, location: &ConfigLocation) -> Result<(), St
             let config = commands::config::load(location)?;
             commands::config::show(&config, location, &mut out).map_err(|e| e.to_string())
         }
+    }
+}
+
+/// `service` subcommands never need the configuration, so a broken file cannot stop you from
+/// stopping or removing the service.
+fn run_service(action: &ServiceAction) -> Result<(), String> {
+    let mut out = std::io::stdout().lock();
+    match action {
+        ServiceAction::Install {
+            exe,
+            delayed_start,
+            no_start,
+        } => commands::service::install(
+            &commands::service::InstallOptions {
+                exe: exe.clone(),
+                delayed_start: *delayed_start,
+                start: !no_start,
+            },
+            &mut out,
+        ),
+        ServiceAction::Uninstall => commands::service::uninstall(&mut out),
+        ServiceAction::Start => commands::service::start(&mut out),
+        ServiceAction::Stop => commands::service::stop(&mut out),
+        ServiceAction::Status => commands::service::status(&mut out),
     }
 }
 
@@ -529,7 +582,9 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 tui::run_terminal(&feed, app, !no_mouse).map_err(io)
             }
         }
-        Command::Config { .. } => unreachable!("handled before the configuration is loaded"),
+        Command::Config { .. } | Command::Service { .. } => {
+            unreachable!("handled before the configuration is loaded")
+        }
     }
 }
 
@@ -537,6 +592,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let location = resolve_config_location(cli.config.clone());
 
+    if let Command::Service { action } = &cli.command {
+        return finish(run_service(action));
+    }
     if let Command::Config { action } = &cli.command {
         return finish(run_config(action, &location));
     }

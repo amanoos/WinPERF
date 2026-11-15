@@ -193,7 +193,10 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - AC: `winperf-service` uses windows-service crate; SCM start/stop/pause states; runs engine with the same crate code path as foreground `monitor`; logs via tracing to file.
   - Verify: install manually with `sc create`, start/stop; samples written while no user is interactive.
   - Deps: T21. Files: `service/main.rs`, `windows/service.rs`.
-- [ ] **T25: `service install/uninstall`, auto-start, recovery actions** (S)
+- [x] **T25: `service install/uninstall`, auto-start, recovery actions** (S)
+  - Done in code, not yet run against the real Service Control Manager. `winperf service install [--exe PATH] [--delayed-start BOOL (default true)] [--no-start]`, `uninstall`, `start`, `stop`, `status` (`commands/service.rs`, no config needed). Install creates service `WinPerf` (LocalSystem, auto-start, delayed by default, description), sets recovery to restart after 5 s, 30 s, then 60 s (count resets after a day) including when the service exits with an error code, and starts it; running it again updates the existing service. Uninstall stops then deletes the service and leaves the database and logs. Install, uninstall, start and stop refuse with a plain message unless the prompt is elevated; `status` needs no rights. The service program is found next to `winperf.exe` or by `--exe`.
+  - Verified: unit tests (service definition, recovery plan, locating the exe, path cleanup), `service status` on this machine (not installed), full check. NOT verified (needs an elevated prompt and changes the machine): install, start, kill-and-restart, reboot, uninstall.
+  - Run by hand, from an elevated prompt in the build folder: `winperf service install`, then `winperf service status`, kill `winperf-service.exe` in Task Manager and watch it return within about 5 s, `winperf service uninstall`.
   - AC: commands need and detect admin; delayed auto-start configurable; recovery restarts on failure; idempotent install/uninstall.
   - Verify: install → reboot test → running; kill process → restarts; uninstall leaves DB intact.
   - Deps: T24. Files: `cli/commands/service.rs`.
