@@ -17,7 +17,9 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// 1. the absolute floor,
 /// 2. `median + z` robust standard deviations (`1.4826 x MAD`, at least `min_spread`), and
 /// 3. `p95_factor x p95`, so a process that often runs near its 95th percentile is not flagged
-///    for doing so.
+///    for doing so, and
+/// 4. `min_ratio x median`, so a resource that naturally swings a lot in relative terms (memory)
+///    is only flagged when it is a real multiple of normal, not merely a bit above it.
 ///
 /// It becomes an anomaly once it has stayed elevated for `sustain_ms`, tolerating
 /// `tolerated_dips` consecutive readings below the line (a single quiet tick does not restart the
@@ -29,6 +31,8 @@ pub struct LevelRule {
     pub floor: f64,
     pub z: f64,
     pub p95_factor: f64,
+    /// The reading must also be at least this many times the median (1.0 = no extra condition).
+    pub min_ratio: f64,
     /// Smallest spread (in the metric's unit) used for the z test, so a perfectly flat baseline
     /// (MAD = 0) does not make every wobble look extreme.
     pub min_spread: f64,
@@ -53,12 +57,21 @@ impl LevelRule {
             Sensitivity::Normal => (1.0, 6.0, 1.5, 1.0),
             Sensitivity::High => (0.6, 4.0, 1.2, 0.5),
         };
+        // Working-set memory legitimately varies by tens of percent (editors, browsers, shells),
+        // so it also has to reach a multiple of normal. Other resources rely on the other tests.
+        let min_ratio = match (metric, sensitivity) {
+            (BaselineMetric::Memory, Sensitivity::Low) => 3.0,
+            (BaselineMetric::Memory, Sensitivity::Normal) => 2.0,
+            (BaselineMetric::Memory, Sensitivity::High) => 1.5,
+            _ => 1.0,
+        };
         Self {
             metric,
             sensitivity,
             floor: floor * floor_scale,
             z,
             p95_factor,
+            min_ratio,
             min_spread,
             sustain_ms: (sustain_secs * sustain_scale * 1000.0) as i64,
             tolerated_dips: 1,
@@ -71,6 +84,7 @@ impl LevelRule {
         self.floor
             .max(baseline.median + self.z * spread)
             .max(baseline.p95 * self.p95_factor)
+            .max(baseline.median * self.min_ratio)
     }
 
     /// The smallest "normal" used as the denominator when saying how many times above normal a
@@ -206,6 +220,18 @@ mod tests {
     fn a_process_that_often_runs_near_its_p95_is_not_flagged_for_it() {
         let t = cpu(Sensitivity::Normal).threshold(&baseline(5.0, 0.1, 40.0));
         assert_eq!(t, 60.0, "1.5 x p95 dominates");
+    }
+
+    #[test]
+    fn memory_must_reach_a_multiple_of_normal() {
+        // A 1.6 GiB app at 2.4 GiB (+50%) is ordinary growth at normal sensitivity.
+        let b = baseline(1.6 * 1024.0 * MIB, 10.0 * MIB, 1.7 * 1024.0 * MIB);
+        let normal = LevelRule::new(BaselineMetric::Memory, Sensitivity::Normal);
+        assert!((normal.threshold(&b) - 3.2 * 1024.0 * MIB).abs() < MIB);
+        let high = LevelRule::new(BaselineMetric::Memory, Sensitivity::High);
+        assert!((high.threshold(&b) - 2.4 * 1024.0 * MIB).abs() < MIB);
+        // CPU is unaffected by the ratio.
+        assert_eq!(cpu(Sensitivity::Normal).min_ratio, 1.0);
     }
 
     #[test]
