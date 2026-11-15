@@ -13,11 +13,14 @@ use winperf_storage::{Database, ListedBaseline};
 pub fn update(
     db: &mut Database,
     windows: &[u32],
+    raw_days: u32,
     now_ms: i64,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for &hours in windows {
-        let r = db.recompute_baselines(now_ms, hours)?;
+        // A window longer than the raw samples are kept comes from the 1-minute rollups.
+        let rollup = (hours > raw_days.saturating_mul(24)).then_some(60_000);
+        let r = db.recompute_baselines_from(now_ms, hours, rollup)?;
         writeln!(
             out,
             "{hours} h window: {} subjects, {} rows",
@@ -203,7 +206,7 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         seed(&mut db, now);
         let mut out = Vec::new();
-        update(&mut db, &[1, 24], now, &mut out).unwrap();
+        update(&mut db, &[1, 24], 2, now, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("1 h window: 1 subjects, 2 rows"), "{text}");
         assert!(text.contains("24 h window: 1 subjects, 2 rows"), "{text}");

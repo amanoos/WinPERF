@@ -313,17 +313,21 @@
     const box = $('rankings');
     box.replaceChildren();
     let sampled = 1;
+    let res = 0;
     results.forEach((r, i) => {
       const data = r.status === 'fulfilled' ? r.value : null;
       if (data && data.sampled_every_ticks > sampled) sampled = data.sampled_every_ticks;
+      if (data && data.resolution_ms) res = data.resolution_ms;
       box.append(rankingCard(METRICS[i], data));
     });
     $('rankings-note').textContent =
       'Average is over the whole range, counting the time something was not running as zero, so a short burst ranks below steady work. ' +
       'Processes with several copies running are added together. ' +
+      (res ? 'This range reaches back past the raw samples, so it is read from ' + ago(res) +
+          ' averages (older history is kept as averages); peaks are the highest average of one such period. ' : '') +
       (sampled > 1
-        ? 'This range is long, so it is read from about every ' + sampled + 'th sample (roughly every ' +
-          ago(sampled * intervalSecs * 1000) + '); peaks are the highest of those moments.'
+        ? 'This range is long, so it is read from about every ' + sampled + 'th ' + (res ? 'period' : 'sample') + ' (roughly every ' +
+          ago(sampled * (res || intervalSecs * 1000)) + '); peaks are the highest of those moments.'
         : '');
   }
 
@@ -462,9 +466,14 @@
         'with the stretch between them shaded. It was computed ' + when(any.computed_at_ms) + ' from ' + any.observations +
         ' samples. Values are totals over all running copies, averaged within each point; gaps mean it was not running or not recorded.'
       : 'No baseline has been stored for this yet; it needs the monitor to have recorded it for a while.';
+    if (d.resolution_ms) {
+      $('d-baseline-note').textContent += ' This range reaches back past the raw samples, so the history shows ' +
+        ago(d.resolution_ms) + ' averages.';
+    }
     if (d.sampled_every_ticks > 1) {
       $('d-baseline-note').textContent += ' This range is long, so the history is read from about every ' + d.sampled_every_ticks +
-        'th sample (roughly every ' + ago(d.sampled_every_ticks * intervalSecs * 1000) + '); a program that ran for less than that can be missing.';
+        'th ' + (d.resolution_ms ? 'period' : 'sample') + ' (roughly every ' +
+        ago(d.sampled_every_ticks * (d.resolution_ms || intervalSecs * 1000)) + '); a program that ran for less than that can be missing.';
     }
   }
 
@@ -775,6 +784,7 @@
     return { from: to - RANGES[rangeKey], to };
   }
 
+  let chartRes = 0;
   let busy = false;
   async function refresh(force) {
     if (busy) return;
@@ -794,9 +804,13 @@
       showNotice(failed ? failed.reason.message : '');
       if (status.status === 'fulfilled') showStatus(status.value);
       if (current.status === 'fulfilled') showNow(current.value);
-      if (system.status === 'fulfilled') drawCharts(system.value, from, to);
+      if (system.status === 'fulfilled') {
+        drawCharts(system.value, from, to);
+        chartRes = system.value.resolution_ms || 0;
+      }
       if (anomalies.status === 'fulfilled') showAnomalies(anomalies.value);
-      $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString() +
+        (chartRes ? ' · the charts show ' + ago(chartRes) + ' averages (older than the raw samples)' : '');
     } finally {
       busy = false;
     }

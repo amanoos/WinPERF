@@ -93,20 +93,33 @@ impl Database {
         now_ms: i64,
         window_hours: u32,
     ) -> Result<RecomputeReport> {
+        self.recompute_baselines_from(now_ms, window_hours, None)
+    }
+
+    /// Like [`Self::recompute_baselines`], but with `Some(res_ms)` the points are the rollup
+    /// buckets of that width (the average over each bucket) instead of raw ticks. This is how a
+    /// window longer than the raw retention is computed: the raw samples no longer cover it.
+    /// Statistics over bucket averages are smoother than over raw ticks (a spike is averaged into
+    /// its bucket), which suits the sustained deviations the detectors look for.
+    pub fn recompute_baselines_from(
+        &mut self,
+        now_ms: i64,
+        window_hours: u32,
+        rollup_res_ms: Option<i64>,
+    ) -> Result<RecomputeReport> {
         let since = now_ms - i64::from(window_hours) * MS_PER_HOUR;
         let mut computed: Vec<(Scope, i64, SubjectBaseline)> = Vec::new();
 
         for scope in Scope::ALL {
             let col = subject_column(scope);
-            let mut stmt = self.conn().prepare(&format!(
-                "SELECT pi.{col}, rs.ts_ms, SUM(rs.cpu_percent), SUM(rs.working_set_bytes), \
-                 SUM(rs.private_bytes), SUM(rs.io_read_bytes_per_sec), \
-                 SUM(rs.io_write_bytes_per_sec), SUM(rs.net_rx_bytes_per_sec), \
-                 SUM(rs.net_tx_bytes_per_sec) \
-                 FROM resource_samples rs JOIN process_instances pi ON pi.id = rs.process_instance_id \
-                 WHERE rs.ts_ms BETWEEN ?1 AND ?2 AND pi.{col} IS NOT NULL \
-                 GROUP BY pi.{col}, rs.ts_ms ORDER BY pi.{col}, rs.ts_ms"
-            ))?;
+            let mut stmt = match rollup_res_ms {
+                None => self.conn().prepare(&format!(
+                    "SELECT pi.{col}, rs.ts_ms, SUM(rs.cpu_percent), SUM(rs.working_set_bytes),                      SUM(rs.private_bytes), SUM(rs.io_read_bytes_per_sec),                      SUM(rs.io_write_bytes_per_sec), SUM(rs.net_rx_bytes_per_sec),                      SUM(rs.net_tx_bytes_per_sec)                      FROM resource_samples rs JOIN process_instances pi ON pi.id = rs.process_instance_id                      WHERE rs.ts_ms BETWEEN ?1 AND ?2 AND pi.{col} IS NOT NULL                      GROUP BY pi.{col}, rs.ts_ms ORDER BY pi.{col}, rs.ts_ms"
+                ))?,
+                Some(res) => self.conn().prepare(&format!(
+                    "SELECT pi.{col}, rs.bucket_ts, SUM(rs.cpu_avg), SUM(rs.working_set_avg),                      SUM(rs.private_avg), SUM(rs.io_read_avg), SUM(rs.io_write_avg),                      SUM(rs.net_rx_avg), SUM(rs.net_tx_avg)                      FROM process_rollups rs JOIN process_instances pi ON pi.id = rs.process_instance_id                      WHERE rs.res_ms = {res} AND rs.bucket_ts BETWEEN ?1 AND ?2                        AND pi.{col} IS NOT NULL                      GROUP BY pi.{col}, rs.bucket_ts ORDER BY pi.{col}, rs.bucket_ts"
+                ))?,
+            };
             let mut rows = stmt.query(params![since, now_ms])?;
 
             let mut current: Option<i64> = None;

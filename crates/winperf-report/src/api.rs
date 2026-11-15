@@ -286,13 +286,15 @@ pub async fn system(State(shared): State<Shared>, Query(q): Query<SystemQuery>) 
     }
     let points = q.points.unwrap_or(600).clamp(10, 2000);
     let body = with_db(&shared, move |db| {
-        let samples = db
-            .system_samples_between(from_ms, to_ms)
+        // Raw samples, or the rollups when the range reaches back past the raw retention.
+        let (source, samples) = db
+            .system_history_between(from_ms, to_ms)
             .map_err(read_err)?;
         let (bucket_ms, rows) = downsample(&samples, from_ms, to_ms, points);
         Ok(json!({
             "from_ms": from_ms,
             "to_ms": to_ms,
+            "resolution_ms": source.resolution_ms(),
             "samples": samples.len(),
             "bucket_ms": bucket_ms,
             "points": rows,
@@ -370,6 +372,7 @@ pub async fn rankings(State(shared): State<Shared>, Query(q): Query<RankingQuery
             "to_ms": to_ms,
             "ticks": ranking.ticks,
             "sampled_every_ticks": ranking.sampled_every,
+            "resolution_ms": ranking.resolution_ms,
             "available": ranking.available,
             "note": note,
             "rows": ranking.rows.iter().map(|r| json!({
@@ -487,6 +490,7 @@ pub async fn subject(
             "bucket_ms": bucket_ms,
             "ticks": series.ticks,
             "sampled_every_ticks": series.sampled_every,
+            "resolution_ms": series.resolution_ms,
             "series": series.points.iter().map(|p| json!({
                 "ts_ms": p.ts_ms,
                 "cpu_percent": p.cpu,
@@ -639,8 +643,8 @@ pub async fn anomaly(State(shared): State<Shared>, Path(id): Path<i64>) -> ApiRe
         let ended = a.resolved_ts_ms.unwrap_or(a.last_update_ts_ms);
         let from_ms = a.detected_ts_ms - CONTEXT_MARGIN_MS;
         let to_ms = ended.min(a.detected_ts_ms + CONTEXT_MAX_MS) + CONTEXT_MARGIN_MS;
-        let system = db
-            .system_samples_between(from_ms, to_ms)
+        let (_, system) = db
+            .system_history_between(from_ms, to_ms)
             .map_err(read_err)?;
         let (bucket_ms, system_points) = downsample(&system, from_ms, to_ms, 240);
         let process = match a.process_instance_id {

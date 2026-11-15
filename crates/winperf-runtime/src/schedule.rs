@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use winperf_core::config::RetentionConfig;
 use winperf_core::time::unix_millis_now;
-use winperf_storage::Database;
+use winperf_storage::{Database, Limits};
 
 /// How often the schedule thread looks at the clock and the stop flag.
 const POLL: Duration = Duration::from_millis(200);
@@ -30,15 +31,17 @@ pub fn spawn_schedule(
     db_path: PathBuf,
     windows: Vec<u32>,
     base: Duration,
+    raw_days: u32,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
-    spawn_schedule_with(db_path, windows, base, PER_WINDOW_HOUR, stop)
+    spawn_schedule_with(db_path, windows, base, PER_WINDOW_HOUR, raw_days, stop)
 }
 fn spawn_schedule_with(
     db_path: PathBuf,
     windows: Vec<u32>,
     base: Duration,
     per_hour: Duration,
+    raw_days: u32,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -57,7 +60,7 @@ fn spawn_schedule_with(
             }
             let result = Database::open(&db_path)
                 .map_err(Box::<dyn std::error::Error>::from)
-                .and_then(|mut db| recompute(&mut db, &ready));
+                .and_then(|mut db| recompute(&mut db, &ready, raw_days));
             if let Err(e) = result {
                 eprintln!("winperf: baseline recompute failed: {e}");
             }
@@ -65,13 +68,69 @@ fn spawn_schedule_with(
     })
 }
 
-/// Recompute the baselines of the given windows.
-fn recompute(db: &mut Database, windows: &[u32]) -> Result<(), Box<dyn std::error::Error>> {
+/// Recompute the baselines of the given windows. A window longer than the raw samples are kept
+/// is computed from the 1-minute rollups, which cover it; shorter ones from the raw ticks.
+fn recompute(
+    db: &mut Database,
+    windows: &[u32],
+    raw_days: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let now = unix_millis_now();
     for &hours in windows {
-        db.recompute_baselines(now, hours)?;
+        let rollup = (hours > raw_days.saturating_mul(24)).then_some(60_000);
+        db.recompute_baselines_from(now, hours, rollup)?;
     }
     Ok(())
+}
+
+/// How long the maintenance thread waits between passes, and when a pass left work undone.
+const MAINTENANCE_EVERY: Duration = Duration::from_secs(60);
+const MAINTENANCE_CATCH_UP: Duration = Duration::from_secs(5);
+/// Nothing is done in the first moments of a run, when the monitor is busiest.
+const MAINTENANCE_FIRST: Duration = Duration::from_secs(60);
+
+/// Build the rollups and delete what has outlived its retention, beside the recorder, on its own
+/// connection and in small transactions (see `Database::maintain`). A pass that stopped at its
+/// work limit is followed by another after a few seconds, so a big backlog is worked off in
+/// pieces; otherwise it runs once a minute. Failures are reported and retried; they never stop
+/// the recorder.
+pub fn spawn_maintenance(
+    db_path: PathBuf,
+    retention: RetentionConfig,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut next = Instant::now() + MAINTENANCE_FIRST;
+        while !stop.load(Ordering::Relaxed) {
+            if Instant::now() < next {
+                thread::sleep(POLL);
+                continue;
+            }
+            next = Instant::now() + MAINTENANCE_EVERY;
+            let result = Database::open(&db_path)
+                .and_then(|mut db| db.maintain(unix_millis_now(), &retention, Limits::default()));
+            match result {
+                Ok(report) => {
+                    if report.did_anything() {
+                        eprintln!(
+                            "maintenance: {} min and {} quarter hours rolled up; deleted {} raw,                              {} + {} rollup rows, {} anomalies, {} process records",
+                            report.minutes_rolled,
+                            report.quarters_rolled,
+                            report.raw_deleted + report.system_raw_deleted,
+                            report.minute_rollups_deleted,
+                            report.quarter_rollups_deleted,
+                            report.anomalies_deleted,
+                            report.instances_deleted
+                        );
+                    }
+                    if report.more {
+                        next = Instant::now() + MAINTENANCE_CATCH_UP;
+                    }
+                }
+                Err(e) => eprintln!("winperf: maintenance failed (will retry): {e}"),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -123,6 +182,7 @@ mod tests {
             vec![1],
             Duration::from_millis(50),
             Duration::ZERO,
+            2,
             stop.clone(),
         );
 
@@ -136,5 +196,20 @@ mod tests {
         assert!(reader.baseline_count().unwrap() > 0);
         drop(reader);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_maintenance_thread_waits_out_the_start_up_and_stops_on_request() {
+        let dir = std::env::temp_dir().join(format!("winperf-cli-maint-{}", std::process::id()));
+        let path = dir.join("m.db");
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_maintenance(path, RetentionConfig::default(), stop.clone());
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "stops promptly");
+        // Nothing ran in that time (the first pass comes a minute in), so no file was created.
+        assert!(!dir.join("m.db").exists());
     }
 }

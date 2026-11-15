@@ -714,3 +714,77 @@ async fn a_busy_report_does_not_stop_the_recorder_writing() {
         "a commit took {slowest:?} while the report was being read"
     );
 }
+
+#[tokio::test]
+async fn history_older_than_the_raw_samples_is_served_from_the_rollups() {
+    use winperf_core::config::RetentionConfig;
+    let s = Scratch::new();
+    let now = unix_millis_now();
+    {
+        let mut db = Database::open(&s.db()).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO process_instances (id, pid, start_time, parent_pid, name, first_seen, \
+                 last_seen) VALUES (1, 1, 1, 0, 'old.exe', 't', 't')",
+            )
+            .unwrap();
+        // One tick a minute from five days ago to now; the first two and a half days at cpu 40.
+        for minute in 0..(5 * 1440i64) {
+            let ts = now - (5 * 1440 - minute) * 60_000;
+            let cpu = if minute < 2 * 1440 + 720 { 40.0 } else { 5.0 };
+            db.conn()
+                .execute_batch(&format!(
+                    "INSERT INTO system_samples (ts_ms, cpu_percent) VALUES ({ts}, {cpu}); \
+                     INSERT INTO resource_samples (process_instance_id, ts_ms, cpu_percent) \
+                     VALUES (1, {ts}, {cpu})"
+                ))
+                .unwrap();
+        }
+        let keep = RetentionConfig {
+            raw_samples_days: 2,
+            aggregate_1min_days: 14,
+            aggregate_15min_days: 180,
+            anomaly_days: 180,
+        };
+        db.maintain(now, &keep, winperf_storage::Limits::unlimited())
+            .unwrap();
+    }
+    let app = app(settings(s.db(), None));
+    let day = 24 * 3_600_000;
+    let old = format!("from_ms={}&to_ms={}", now - 4 * day, now - 3 * day);
+    let (code, system) = local(&app, &format!("/api/system?{old}&points=50")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        system["resolution_ms"], 60_000,
+        "older than the raw samples"
+    );
+    assert_eq!(system["samples"], 1440);
+    assert_eq!(system["points"][0]["cpu_percent"], 40.0);
+
+    let (_, recent) = local(
+        &app,
+        &format!("/api/system?from_ms={}&to_ms={}", now - 3_600_000, now),
+    )
+    .await;
+    assert_eq!(recent["resolution_ms"], 0, "recent history is still raw");
+
+    let (_, csv, _) = raw(&app, &format!("/api/export/history?{old}")).await;
+    assert_eq!(
+        csv.trim_end().split("\r\n").count(),
+        1441,
+        "a header and a row per minute"
+    );
+
+    // Rankings over the whole five days read the rollups and say so.
+    let (_, rank) = local(
+        &app,
+        &format!(
+            "/api/rankings?metric=cpu&from_ms={}&to_ms={}",
+            now - 5 * day,
+            now
+        ),
+    )
+    .await;
+    assert_eq!(rank["resolution_ms"], 60_000);
+    assert_eq!(rank["rows"][0]["name"], "old.exe");
+}

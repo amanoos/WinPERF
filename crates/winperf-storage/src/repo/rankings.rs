@@ -8,6 +8,7 @@
 
 use crate::db::Database;
 use crate::error::Result;
+use crate::repo::maintenance::HistorySource;
 use rusqlite::params;
 
 /// The most ticks one ranking reads.
@@ -119,6 +120,9 @@ pub struct Ranking {
     /// 1 when every tick was read; N when only every Nth was (long periods), which makes peaks
     /// the highest of the sampled moments.
     pub sampled_every: i64,
+    /// 0 when read from the raw samples, else the width of the rollup buckets in milliseconds
+    /// (a long range reaches back past the raw retention).
+    pub resolution_ms: i64,
     pub rows: Vec<RankRow>,
 }
 
@@ -138,13 +142,29 @@ impl Database {
     /// ones with the newest always among them: reading every sample of a long period takes many
     /// seconds, while an even subset gives the same averages and is read in a fraction of the time.
     /// (Peaks, and programs shorter than the gap between picked ticks, can be missed.)
-    pub(crate) fn pick_ticks(&self, from_ms: i64, to_ms: i64, max: usize) -> Result<TickPick> {
-        let all: Vec<i64> = {
-            let mut stmt = self.conn().prepare(
-                "SELECT ts_ms FROM system_samples WHERE ts_ms BETWEEN ?1 AND ?2 ORDER BY ts_ms",
-            )?;
-            let rows = stmt.query_map(params![from_ms, to_ms], |r| r.get(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
+    pub(crate) fn pick_ticks(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        max: usize,
+        source: HistorySource,
+    ) -> Result<TickPick> {
+        let all: Vec<i64> = match source {
+            HistorySource::Raw => {
+                let mut stmt = self.conn().prepare(
+                    "SELECT ts_ms FROM system_samples WHERE ts_ms BETWEEN ?1 AND ?2 ORDER BY ts_ms",
+                )?;
+                let rows = stmt.query_map(params![from_ms, to_ms], |r| r.get(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            HistorySource::Rollup(res) => {
+                let mut stmt = self.conn().prepare(
+                    "SELECT bucket_ts FROM system_rollups \
+                     WHERE res_ms = ?3 AND bucket_ts BETWEEN ?1 AND ?2 ORDER BY bucket_ts",
+                )?;
+                let rows = stmt.query_map(params![from_ms, to_ms, res], |r| r.get(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            }
         };
         let stride = all.len().div_ceil(max).max(1);
         // Newest first, so the newest tick is always picked.
@@ -175,19 +195,43 @@ impl Database {
         limit: u32,
     ) -> Result<Ranking> {
         let col = metric.column();
+        let source = self.history_source(from_ms)?;
+        // The same query reads raw samples or rollup rows; a rollup tick is a bucket, its value
+        // the bucket's average and its peak the bucket's maximum (summed over instances).
+        let (table, ts, scope, value, peak) = match source {
+            HistorySource::Raw => (
+                "resource_samples",
+                "ts_ms",
+                String::new(),
+                format!("rs.{col}"),
+                format!("rs.{col}"),
+            ),
+            HistorySource::Rollup(res) => {
+                let stem = HistorySource::rollup_stem(col);
+                (
+                    "process_rollups",
+                    "bucket_ts",
+                    format!(" AND rs.res_ms = {res}"),
+                    format!("rs.{stem}_avg"),
+                    format!("rs.{stem}_max"),
+                )
+            }
+        };
+        let resolution_ms = source.resolution_ms();
         let TickPick {
             picked,
             list,
             total,
             stride,
-        } = self.pick_ticks(from_ms, to_ms, MAX_TICKS)?;
+        } = self.pick_ticks(from_ms, to_ms, MAX_TICKS, source)?;
         let ticks = total.max(1);
         let sampled_every = stride;
         // Measured at any of the ticks that are read? (Cheap, and the same ticks the ranking uses.)
         let available: bool = self.conn().query_row(
             &format!(
-                "SELECT EXISTS (SELECT 1 FROM resource_samples \
-                 WHERE ts_ms IN (SELECT value FROM json_each(?1)) AND {col} IS NOT NULL)"
+                "SELECT EXISTS (SELECT 1 FROM {table} rs \
+                 WHERE rs.{ts} IN (SELECT value FROM json_each(?1)) \
+                   AND {value} IS NOT NULL{scope})"
             ),
             params![list],
             |r| r.get(0),
@@ -197,6 +241,7 @@ impl Database {
                 available,
                 ticks,
                 sampled_every,
+                resolution_ms,
                 rows: Vec::new(),
             });
         };
@@ -205,13 +250,14 @@ impl Database {
             "WITH per_tick AS ( \
                  SELECT {key} AS k, MAX({label}) AS label, MAX(ia.name) AS app, \
                         MAX(pi.executable_id) AS exe_id, MAX(pi.application_id) AS app_id, \
-                        rs.ts_ms AS ts, SUM(rs.{col}) AS v \
-                 FROM resource_samples rs \
+                        rs.{ts} AS ts, SUM({value}) AS v, SUM({peak}) AS pk \
+                 FROM {table} rs \
                  JOIN process_instances pi ON pi.id = rs.process_instance_id \
                  LEFT JOIN installed_applications ia ON ia.id = pi.application_id \
-                 WHERE rs.ts_ms IN (SELECT value FROM json_each(?1)) AND rs.{col} IS NOT NULL \
-                 GROUP BY k, rs.ts_ms) \
-             SELECT label, MAX(app), SUM(v), MAX(v), SUM(CASE WHEN ts = ?2 THEN v END), \
+                 WHERE rs.{ts} IN (SELECT value FROM json_each(?1)) \
+                   AND {value} IS NOT NULL{scope} \
+                 GROUP BY k, rs.{ts}) \
+             SELECT label, MAX(app), SUM(v), MAX(pk), SUM(CASE WHEN ts = ?2 THEN v END), \
                     MAX(exe_id), MAX(app_id) \
              FROM per_tick GROUP BY k ORDER BY SUM(v) DESC, label LIMIT ?3"
         );
@@ -233,6 +279,7 @@ impl Database {
             available,
             ticks,
             sampled_every,
+            resolution_ms,
             rows: rows.collect::<std::result::Result<Vec<_>, _>>()?,
         })
     }

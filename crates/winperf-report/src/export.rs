@@ -268,7 +268,7 @@ async fn history(shared: Shared, format: Format, q: ExportQuery) -> Result<Respo
         let mut encoder = Encoder::new(format, &HISTORY_COLUMNS);
         let mut batch: Vec<Vec<Cell>> = Vec::with_capacity(CHUNK_ROWS);
         let mut open = true;
-        let read = db.system_samples_each(from_ms, to_ms, |s| {
+        let read = db.system_history_each(from_ms, to_ms, |s| {
             let big = |v: Option<u64>| v.map_or(Cell::Null, |x| Cell::Int(x as i64));
             batch.push(vec![
                 Cell::Int(s.ts_ms),

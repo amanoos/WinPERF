@@ -95,6 +95,12 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Run the retention job now: build the rollups and delete what has outlived its retention
+    Maintain {
+        /// Also compact the database file afterwards (needs no monitor to be recording)
+        #[arg(long)]
+        vacuum: bool,
+    },
     /// Per-process network usage (needs administrator rights)
     Network {
         #[command(subcommand)]
@@ -433,8 +439,14 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             match action {
                 BaselineAction::Update => {
                     let mut db = Database::open(&db_path).map_err(|e| e.to_string())?;
-                    commands::baseline::update(&mut db, windows, unix_millis_now(), &mut out)
-                        .map_err(|e| e.to_string())
+                    commands::baseline::update(
+                        &mut db,
+                        windows,
+                        config.retention.raw_samples_days,
+                        unix_millis_now(),
+                        &mut out,
+                    )
+                    .map_err(|e| e.to_string())
                 }
                 BaselineAction::List { window } => {
                     let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
@@ -528,6 +540,17 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 &mut std::io::stdout().lock(),
             )
             .map_err(io)
+        }
+        Command::Maintain { vacuum } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            commands::maintain::run(
+                &db_path,
+                &config.retention,
+                vacuum,
+                unix_millis_now(),
+                &mut std::io::stdout().lock(),
+            )
+            .map_err(|e| e.to_string())
         }
         Command::Network {
             action: NetworkAction::Now { seconds },

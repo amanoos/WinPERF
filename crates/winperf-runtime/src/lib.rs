@@ -75,6 +75,13 @@ pub fn run_configured(
         db_path.to_path_buf(),
         config.baseline.windows_hours.clone(),
         Duration::from_secs(u64::from(config.baseline.recompute_minutes) * 60),
+        config.retention.raw_samples_days,
+        Arc::clone(stop),
+    );
+    // Rollups and retention run beside it, on their own connection.
+    let maintenance = schedule::spawn_maintenance(
+        db_path.to_path_buf(),
+        config.retention.clone(),
         Arc::clone(stop),
     );
     let detect = DetectSettings::new(
@@ -98,5 +105,6 @@ pub fn run_configured(
     // A run that ended by itself (max_ticks) never set the flag; stop the schedule too.
     stop.store(true, Ordering::Relaxed);
     let _ = schedule.join();
+    let _ = maintenance.join();
     result
 }

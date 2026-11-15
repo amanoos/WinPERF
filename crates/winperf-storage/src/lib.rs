@@ -16,10 +16,10 @@ pub use paths::{
     resolve_db_path,
 };
 pub use repo::{
-    AnomalyFilter, CurrentProcess, ExecutableRow, FileIdentity, ListedBaseline, ProfileState,
-    RankGroup, RankMetric, RankRow, Ranking, RecomputeReport, SampleHealth, StoredAnomaly,
-    StoredBaseline, StoredSample, StoredSystemSample, SubjectExecutable, SubjectInfo, SubjectPoint,
-    SubjectRun, SubjectSeries,
+    AnomalyFilter, CurrentProcess, ExecutableRow, FileIdentity, Limits, ListedBaseline,
+    MaintenanceReport, ProfileState, RankGroup, RankMetric, RankRow, Ranking, RecomputeReport,
+    SampleHealth, StoredAnomaly, StoredBaseline, StoredSample, StoredSystemSample,
+    SubjectExecutable, SubjectInfo, SubjectPoint, SubjectRun, SubjectSeries,
 };
 pub use sink::DbSink;
 

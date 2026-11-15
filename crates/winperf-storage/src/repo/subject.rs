@@ -4,6 +4,7 @@
 
 use crate::db::Database;
 use crate::error::Result;
+use crate::repo::maintenance::HistorySource;
 use rusqlite::{OptionalExtension, params};
 use winperf_core::profiler::baseline::Scope;
 
@@ -74,6 +75,8 @@ pub struct SubjectSeries {
     /// were read; N = every Nth, for long periods, so a program shorter than that can be missed).
     pub ticks: i64,
     pub sampled_every: i64,
+    /// 0 for raw samples, else the width of the rollup buckets read (a range past the raw ones).
+    pub resolution_ms: i64,
     pub points: Vec<SubjectPoint>,
 }
 
@@ -200,17 +203,50 @@ impl Database {
         bucket_ms: i64,
     ) -> Result<SubjectSeries> {
         let col = column(scope);
-        let pick = self.pick_ticks(from_ms, to_ms, MAX_TICKS)?;
+        let source = self.history_source(from_ms)?;
+        let pick = self.pick_ticks(from_ms, to_ms, MAX_TICKS, source)?;
+        // Raw samples, or rollup buckets (their averages) for a range older than the raw ones.
+        let (table, ts, scope, c) = match source {
+            HistorySource::Raw => (
+                "resource_samples",
+                "ts_ms",
+                String::new(),
+                [
+                    "cpu_percent",
+                    "working_set_bytes",
+                    "io_read_bytes_per_sec",
+                    "io_write_bytes_per_sec",
+                    "net_rx_bytes_per_sec",
+                    "net_tx_bytes_per_sec",
+                ]
+                .map(String::from),
+            ),
+            HistorySource::Rollup(res) => (
+                "process_rollups",
+                "bucket_ts",
+                format!(" AND rs.res_ms = {res}"),
+                [
+                    "cpu",
+                    "working_set",
+                    "io_read",
+                    "io_write",
+                    "net_rx",
+                    "net_tx",
+                ]
+                .map(|stem| format!("{stem}_avg")),
+            ),
+        };
         let mut stmt = self.conn().prepare(&format!(
             "WITH per_tick AS ( \
-                 SELECT rs.ts_ms AS ts, SUM(rs.cpu_percent) AS cpu, SUM(rs.working_set_bytes) AS mem, \
-                        SUM(rs.io_read_bytes_per_sec) AS dr, SUM(rs.io_write_bytes_per_sec) AS dw, \
-                        SUM(rs.net_rx_bytes_per_sec) AS rx, SUM(rs.net_tx_bytes_per_sec) AS tx \
-                 FROM resource_samples rs JOIN process_instances pi ON pi.id = rs.process_instance_id \
-                 WHERE pi.{col} = ?1 AND rs.ts_ms IN (SELECT value FROM json_each(?3)) \
-                 GROUP BY rs.ts_ms) \
+                 SELECT rs.{ts} AS ts, SUM(rs.{}) AS cpu, SUM(rs.{}) AS mem, \
+                        SUM(rs.{}) AS dr, SUM(rs.{}) AS dw, \
+                        SUM(rs.{}) AS rx, SUM(rs.{}) AS tx \
+                 FROM {table} rs JOIN process_instances pi ON pi.id = rs.process_instance_id \
+                 WHERE pi.{col} = ?1 AND rs.{ts} IN (SELECT value FROM json_each(?3)){scope} \
+                 GROUP BY rs.{ts}) \
              SELECT MIN(ts), AVG(cpu), AVG(mem), AVG(dr), AVG(dw), AVG(rx), AVG(tx) \
-             FROM per_tick GROUP BY (ts - ?2) / ?4 ORDER BY MIN(ts)"
+             FROM per_tick GROUP BY (ts - ?2) / ?4 ORDER BY MIN(ts)",
+            c[0], c[1], c[2], c[3], c[4], c[5]
         ))?;
         let rows = stmt.query_map(params![id, from_ms, pick.list, bucket_ms.max(1)], |r| {
             Ok(SubjectPoint {
@@ -226,6 +262,7 @@ impl Database {
         Ok(SubjectSeries {
             ticks: pick.total,
             sampled_every: pick.stride,
+            resolution_ms: source.resolution_ms(),
             points: rows.collect::<std::result::Result<Vec<_>, _>>()?,
         })
     }
