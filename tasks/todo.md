@@ -314,6 +314,7 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - Deps: T35.
 
 ### Checkpoint 7: Release candidate
+- [ ] **Review prepared, waiting for the human's go/no-go.** `docs/release-candidate-review.md`: checks just run (clean tree, check script, cargo audit, net check, release build, about 626 tests), PRD coverage table, the open items (Checkpoint 4 day of use and sensitivity sign-off; Checkpoint 5 and T36's 24 h service run; Checkpoint 1's inventory review taken as covered by the walkthrough; fresh-machine install), known limitations, and a recommendation: go as a release candidate on your own machine with two conditions, no-go for wider distribution until those and an installer exist.
 - [ ] All acceptance criteria met; human review and go/no-go.
 
 ## Parallelization
