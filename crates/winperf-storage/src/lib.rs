@@ -9,7 +9,7 @@ pub mod repo;
 pub mod sink;
 
 pub use db::Database;
-pub use detect::{DetectSettings, DetectingSink};
+pub use detect::{DetectSettings, DetectingSink, Notice};
 pub use error::{Result, StorageError};
 pub use paths::{
     ConfigLocation, ENV_CONFIG, ENV_DB, config_location, default_db_path, resolve_config_location,

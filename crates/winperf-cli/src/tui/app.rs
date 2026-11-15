@@ -1,6 +1,7 @@
 //! TUI state and behaviour, independent of drawing and of the terminal: feed it engine batches
 //! and key presses, read back what to show. Everything here is unit-tested without a terminal.
 
+use crate::tui::anomalies::{AnomalySource, AnomalyView};
 use crate::tui::baselines::{BaselineSource, BaselineView, Nav};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -20,6 +21,7 @@ use winperf_core::{Metric, ProcessKey};
 pub enum View {
     Processes,
     Baselines,
+    Anomalies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +148,7 @@ pub struct App {
     pub header_y: u16,
     pub view: View,
     pub baselines: BaselineView,
+    pub anomalies: AnomalyView,
 }
 
 impl App {
@@ -166,6 +169,7 @@ impl App {
             header_y: 0,
             view: View::Processes,
             baselines: BaselineView::new(None),
+            anomalies: AnomalyView::new(None),
         }
     }
 
@@ -176,6 +180,27 @@ impl App {
             self.view = View::Baselines;
         }
         self
+    }
+
+    /// Give the Anomaly Explorer (and the dashboard's anomaly badge) a database to read,
+    /// optionally opening on the explorer.
+    pub fn with_anomalies(mut self, source: AnomalySource, open: bool) -> Self {
+        self.anomalies = AnomalyView::new(Some(source));
+        if open {
+            self.view = View::Anomalies;
+        }
+        self
+    }
+
+    /// Re-read the stored anomalies if they are old, on every screen (the badge needs them).
+    /// Returns whether the screen changed.
+    pub fn refresh_anomalies_if_due(&mut self) -> bool {
+        let changed = self.anomalies.refresh_if_due();
+        if changed && self.view == View::Anomalies {
+            // Looking at the explorer: what it shows counts as seen.
+            self.anomalies.mark_seen();
+        }
+        changed
     }
 
     /// Re-read the stored baselines if the explorer is showing and its data is old or was
@@ -303,6 +328,14 @@ impl App {
             }
             return;
         }
+        if self.view == View::Anomalies {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.anomalies.scroll(-3),
+                MouseEventKind::ScrollDown => self.anomalies.scroll(3),
+                _ => {}
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if mouse.row == self.header_y {
@@ -341,8 +374,21 @@ impl App {
             }
             return;
         }
+        if self.view == View::Anomalies {
+            match self.anomalies.on_key(key) {
+                Nav::Back => self.view = View::Processes,
+                Nav::Quit => self.should_quit = true,
+                Nav::Stay => {}
+            }
+            return;
+        }
         let page = self.page_size.max(1) as isize;
         match (key.code, key.modifiers) {
+            (KeyCode::Char('e'), _) => {
+                self.view = View::Anomalies;
+                self.anomalies.mark_stale();
+                self.anomalies.mark_seen();
+            }
             (KeyCode::Char('b'), _) => {
                 self.view = View::Baselines;
                 self.baselines.mark_stale();
@@ -703,5 +749,131 @@ pub(crate) mod tests {
                 unreadable: 3
             }
         );
+    }
+
+    // ---- anomalies -----------------------------------------------------------------------
+
+    fn stored_anomaly(
+        id: i64,
+        pid: u32,
+        severity: winperf_core::anomaly::Severity,
+    ) -> winperf_storage::StoredAnomaly {
+        winperf_storage::StoredAnomaly {
+            id,
+            detected_ts_ms: id * 1000,
+            process_instance_id: None,
+            pid,
+            process_name: "busy.exe".into(),
+            application: None,
+            exe_path: r"C:\apps\busy.exe".into(),
+            resource: winperf_core::config::Resource::Cpu,
+            kind: winperf_core::anomaly::AnomalyKind::Deviation,
+            current: 72.0,
+            baseline: 8.0,
+            deviation_pct: 800.0,
+            duration_ms: 120_000,
+            severity,
+            system_cpu_percent: None,
+            system_memory_percent: None,
+            baseline_window_hours: 24,
+            baseline_confidence: "Established".into(),
+            explanation: "busy.exe used a lot of CPU.".into(),
+            resolved_ts_ms: None,
+            last_update_ts_ms: id * 1000,
+            system_disk_percent: None,
+            pressure_percent: None,
+            share_percent: None,
+            impact_score: None,
+        }
+    }
+
+    fn drawn(a: &mut App) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal.draw(|f| crate::tui::ui::draw(f, a)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..28)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn e_opens_the_anomaly_explorer_and_e_or_esc_returns_without_quitting() {
+        let mut a = app();
+        a.on_key(ch('e'));
+        assert_eq!(a.view, View::Anomalies);
+        assert!(!a.should_quit);
+        a.on_key(ch('e'));
+        assert_eq!(a.view, View::Processes);
+        a.on_key(ch('e'));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.view, View::Processes);
+        assert!(!a.should_quit);
+        a.on_key(ch('e'));
+        a.on_key(ch('q'));
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn opening_the_explorer_clears_the_badge() {
+        use winperf_core::anomaly::Severity;
+        let mut a = app();
+        a.anomalies
+            .set_events(vec![stored_anomaly(1, 10, Severity::Warning)]);
+        a.anomalies.set_events(vec![
+            stored_anomaly(2, 11, Severity::High),
+            stored_anomaly(1, 10, Severity::Warning),
+        ]);
+        assert_eq!(a.anomalies.badge().map(|b| b.new), Some(1));
+        a.on_key(ch('e'));
+        assert_eq!(a.anomalies.badge(), None);
+    }
+
+    #[test]
+    fn the_title_shows_the_badge_and_the_process_table_marks_the_process() {
+        use winperf_core::anomaly::Severity;
+        let mut a = app();
+        a.apply_batch(&batch(&[(10, "busy.exe", A(5.0), A(1_000))]));
+        a.anomalies.set_events(vec![]);
+        a.anomalies
+            .set_events(vec![stored_anomaly(1, 10, Severity::Critical)]);
+
+        let lines = drawn(&mut a);
+        let screen = lines.join("\n");
+        assert!(
+            screen.contains("! 1 new anomaly (1 active, worst Critical)"),
+            "{screen}"
+        );
+        let row = lines.iter().find(|l| l.contains("busy.exe")).unwrap();
+        assert!(
+            row.trim_end_matches([' ', '\u{2502}']).ends_with('C'),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn without_anomalies_the_title_has_no_badge_and_the_column_shows_a_dash() {
+        let mut a = app();
+        a.apply_batch(&batch(&[(10, "busy.exe", A(5.0), A(1_000))]));
+        let lines = drawn(&mut a);
+        let screen = lines.join("\n");
+        assert!(!screen.contains("new anomal"), "{screen}");
+        let row = lines.iter().find(|l| l.contains("busy.exe")).unwrap();
+        assert!(
+            row.trim_end_matches([' ', '\u{2502}']).ends_with('-'),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn active_anomalies_without_news_show_a_quiet_count() {
+        use winperf_core::anomaly::Severity;
+        let mut a = app();
+        a.anomalies
+            .set_events(vec![stored_anomaly(1, 10, Severity::Warning)]);
+        let screen = drawn(&mut a).join("\n");
+        assert!(screen.contains("1 active"), "{screen}");
+        assert!(!screen.contains("new anomal"), "{screen}");
     }
 }

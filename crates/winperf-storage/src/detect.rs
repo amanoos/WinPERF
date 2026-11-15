@@ -16,9 +16,10 @@ use crate::db::Database;
 use crate::error::StorageError;
 use crate::sink::DbSink;
 use std::collections::HashMap;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use winperf_core::anomaly::tracker::AnomalyTracker;
-use winperf_core::anomaly::{AnomalyChange, Sensitivities};
+use winperf_core::anomaly::{AnomalyChange, AnomalyEvent, Sensitivities, Severity};
 use winperf_core::config::ConfidenceConfig;
 use winperf_core::engine::{SampleSink, TickBatch};
 
@@ -49,6 +50,29 @@ impl DetectSettings {
     }
 }
 
+/// Something worth telling the person watching, sent as it is stored (see
+/// [`DetectingSink::with_notices`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Notice {
+    /// A new anomaly, stored as row `id`.
+    Raised { id: i64, event: AnomalyEvent },
+    /// An active anomaly got more severe.
+    Worsened { id: i64, event: AnomalyEvent },
+    /// The condition ended.
+    Resolved {
+        id: i64,
+        process_name: String,
+        ts_ms: i64,
+    },
+}
+
+/// What the sink remembers about an active anomaly's row.
+struct ActiveRow {
+    id: i64,
+    severity: Severity,
+    process_name: String,
+}
+
 pub struct DetectingSink {
     inner: DbSink,
     tracker: AnomalyTracker,
@@ -57,7 +81,8 @@ pub struct DetectingSink {
     raised: u64,
     last_error: Option<String>,
     /// The database row of each active anomaly, by the tracker's key for it.
-    rows: HashMap<String, i64>,
+    rows: HashMap<String, ActiveRow>,
+    notices: Option<Sender<Notice>>,
 }
 
 impl DetectingSink {
@@ -71,12 +96,20 @@ impl DetectingSink {
             raised: 0,
             last_error: None,
             rows: HashMap::new(),
+            notices: None,
         };
         // Anything still marked active belongs to a monitor that is no longer running.
         if let Err(e) = sink.inner.database().resolve_stale_anomalies() {
             sink.last_error = Some(format!("closing earlier anomalies: {e}"));
         }
         sink
+    }
+
+    /// Send a [`Notice`] for every anomaly that is raised, gets worse or ends. Sending never
+    /// blocks, and a receiver that has gone away is ignored.
+    pub fn with_notices(mut self, to: Sender<Notice>) -> Self {
+        self.notices = Some(to);
+        self
     }
 
     /// Anomalies raised and stored so far.
@@ -135,21 +168,53 @@ impl DetectingSink {
         self.store(changes, batch.ts_ms);
     }
 
+    fn notify(&self, notice: Notice) {
+        if let Some(to) = &self.notices {
+            let _ = to.send(notice);
+        }
+    }
+
     /// Write what changed: new events are inserted, active ones refreshed, finished ones resolved.
     fn store(&mut self, changes: Vec<AnomalyChange>, now_ms: i64) {
-        let db = self.inner.database();
         for change in changes {
             let result = match change {
-                AnomalyChange::Raised { key, event } => db.insert_anomaly(&event).map(|id| {
-                    self.rows.insert(key, id);
-                    self.raised += 1;
-                }),
-                AnomalyChange::Updated { key, event } => match self.rows.get(&key) {
-                    Some(id) => db.update_anomaly(*id, &event, now_ms),
+                AnomalyChange::Raised { key, event } => {
+                    self.inner.database().insert_anomaly(&event).map(|id| {
+                        self.rows.insert(
+                            key,
+                            ActiveRow {
+                                id,
+                                severity: event.severity,
+                                process_name: event.process_name.clone(),
+                            },
+                        );
+                        self.raised += 1;
+                        self.notify(Notice::Raised { id, event });
+                    })
+                }
+                AnomalyChange::Updated { key, event } => match self.rows.get_mut(&key) {
+                    Some(row) => {
+                        let id = row.id;
+                        let worse = event.severity > row.severity;
+                        row.severity = row.severity.max(event.severity);
+                        let stored = self.inner.database().update_anomaly(id, &event, now_ms);
+                        if worse {
+                            self.notify(Notice::Worsened { id, event });
+                        }
+                        stored
+                    }
                     None => Ok(()),
                 },
                 AnomalyChange::Resolved { key, ts_ms } => match self.rows.remove(&key) {
-                    Some(id) => db.resolve_anomaly(id, ts_ms),
+                    Some(row) => {
+                        let stored = self.inner.database().resolve_anomaly(row.id, ts_ms);
+                        self.notify(Notice::Resolved {
+                            id: row.id,
+                            process_name: row.process_name,
+                            ts_ms,
+                        });
+                        stored
+                    }
                     None => Ok(()),
                 },
             };
@@ -478,5 +543,64 @@ mod tests {
         let db = database_with_baseline(5_000, 600); // CPU baseline only
         let sink = run(db, leaker(), 480);
         assert_eq!(sink.raised(), 0);
+    }
+
+    #[test]
+    fn notices_announce_raised_and_resolved_anomalies() {
+        let db = database_with_baseline(5_000, 600);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let settings = DetectSettings::new(
+            Sensitivities::uniform(Sensitivity::Normal),
+            vec![1, 24, 168],
+            ConfidenceConfig::default(),
+        );
+        let mut engine = Engine::new(
+            burn_then_idle(40, 60),
+            DetectingSink::new(DbSink::new(db), settings).with_notices(tx),
+        );
+        for i in 0..60i64 {
+            engine
+                .tick_with_elapsed(i * 5_000, Duration::from_secs(5))
+                .unwrap();
+        }
+        let notices: Vec<Notice> = rx.try_iter().collect();
+        assert_eq!(notices.len(), 2, "{notices:#?}");
+        let Notice::Raised { id, event } = &notices[0] else {
+            panic!("first is the raise: {notices:?}")
+        };
+        assert_eq!((event.process_name.as_str(), event.pid), ("busy.exe", 7));
+        let Notice::Resolved {
+            id: resolved,
+            process_name,
+            ..
+        } = &notices[1]
+        else {
+            panic!("then the resolution: {notices:?}")
+        };
+        assert_eq!((resolved, process_name.as_str()), (id, "busy.exe"));
+    }
+
+    #[test]
+    fn a_receiver_that_went_away_does_not_stop_detection() {
+        let db = database_with_baseline(5_000, 600);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let settings = DetectSettings::new(
+            Sensitivities::uniform(Sensitivity::Normal),
+            vec![1, 24, 168],
+            ConfidenceConfig::default(),
+        );
+        let mut engine = Engine::new(
+            burner(40, 72),
+            DetectingSink::new(DbSink::new(db), settings).with_notices(tx),
+        );
+        for i in 0..40i64 {
+            engine
+                .tick_with_elapsed(i * 5_000, Duration::from_secs(5))
+                .unwrap();
+        }
+        let sink = engine.into_parts().1;
+        assert_eq!(sink.raised(), 1);
+        assert_eq!(sink.last_error(), None);
     }
 }

@@ -8,4 +8,5 @@ pub mod monitor;
 pub mod network;
 pub mod process;
 pub mod profile;
+pub mod report;
 pub mod system;

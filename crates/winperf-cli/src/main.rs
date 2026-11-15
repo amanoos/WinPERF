@@ -81,6 +81,15 @@ enum Command {
         #[command(subcommand)]
         action: AnomaliesAction,
     },
+    /// Text summary of the anomalies of the last few hours: counts, severity, top offenders
+    Report {
+        /// How many hours back to look
+        #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=8760))]
+        hours: u32,
+        /// Most offenders to list
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        top: u32,
+    },
     /// Show or create the configuration file
     Config {
         #[command(subcommand)]
@@ -105,6 +114,9 @@ enum Command {
         /// Open on the Baseline Explorer instead of the process table (press b to switch)
         #[arg(long)]
         baselines: bool,
+        /// Open on the Anomaly Explorer instead of the process table (press e to switch)
+        #[arg(long)]
+        anomalies: bool,
         /// Instead of the interactive screen, sample twice and print one frame as text
         #[arg(long)]
         snapshot: bool,
@@ -357,6 +369,7 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 commands::monitor::Options {
                     classifier,
                     detect: Some(detect),
+                    bell: std::io::IsTerminal::is_terminal(&std::io::stdout()),
                 },
                 Duration::from_secs(interval),
                 ticks,
@@ -408,6 +421,18 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                     commands::anomalies::show(&db, id, &mut out).map_err(|e| e.to_string())
                 }
             }
+        }
+        Command::Report { hours, top } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
+            commands::report::run(
+                &db,
+                hours,
+                top as usize,
+                unix_millis_now(),
+                &mut std::io::stdout().lock(),
+            )
+            .map_err(|e| e.to_string())
         }
         Command::Profile { action } => {
             let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
@@ -471,12 +496,17 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             no_network,
             no_mouse,
             baselines,
+            anomalies,
             snapshot,
             width,
             height,
         } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let anomaly_source = tui::anomalies::AnomalySource {
+                db_path: db_path.clone(),
+            };
             let source = tui::baselines::BaselineSource {
-                db_path: resolve_db_path(cli.db.clone(), config.storage.database.as_deref()),
+                db_path,
                 windows: config.baseline.windows_hours.clone(),
                 confidence: config.baseline.confidence.clone(),
             };
@@ -500,7 +530,8 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
             };
             let feed = tui::Feed::spawn(make, interval);
             let app = tui::app::App::new(interval, NetworkStatus::RequiresAdmin)
-                .with_baselines(source, baselines);
+                .with_baselines(source, baselines)
+                .with_anomalies(anomaly_source, anomalies && !baselines);
             if snapshot {
                 let text = tui::snapshot(&feed, app, 2, width, height).map_err(io)?;
                 print!("{text}");

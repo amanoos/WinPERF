@@ -4,6 +4,7 @@
 //! channel, so a slow tick never freezes the keyboard. The TUI is a *viewer*: it samples live but
 //! does not write the database (the monitor or service is the single writer).
 
+pub mod anomalies;
 pub mod app;
 pub mod baselines;
 pub mod ui;
@@ -168,6 +169,9 @@ fn event_loop(
         if app.refresh_baselines_if_due() {
             dirty = true;
         }
+        if app.refresh_anomalies_if_due() {
+            dirty = true;
+        }
     }
     Ok(())
 }
@@ -203,6 +207,7 @@ pub fn snapshot(
         apply(&mut app, msg);
     }
     app.refresh_baselines_if_due();
+    app.refresh_anomalies_if_due();
     // The in-memory backend cannot fail (its error type is `Infallible`).
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
     terminal

@@ -93,6 +93,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         super::baselines::draw(f, area, &mut app.baselines);
         return;
     }
+    if app.view == View::Anomalies {
+        super::anomalies::draw(f, area, &mut app.anomalies);
+        return;
+    }
     let [title, system, table, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(8),
@@ -108,15 +112,43 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App) {
-    let title = Line::from(vec![
-        Span::styled(" WinPerf ", Style::new().bold().fg(Color::Cyan)),
-        Span::raw(format!(
-            "System overview - sampling every {}s",
-            app.interval.as_secs()
-        )),
-        Span::styled("   b: baselines", Style::new().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(title), area);
+    let mut spans = vec![Span::styled(
+        " WinPerf ",
+        Style::new().bold().fg(Color::Cyan),
+    )];
+    // The anomaly badge comes first so it is never the part that gets cut off.
+    if let Some(badge) = app.anomalies.badge() {
+        spans.push(Span::styled(
+            badge_text(&badge),
+            super::anomalies::severity_style(badge.worst_new).add_modifier(Modifier::REVERSED),
+        ));
+        spans.push(Span::raw(" "));
+    } else if app.anomalies.active_count() > 0 {
+        spans.push(Span::styled(
+            format!("{} active ", app.anomalies.active_count()),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::raw(format!(
+        "System overview - sampling every {}s",
+        app.interval.as_secs()
+    )));
+    spans.push(Span::styled(
+        "   e: anomalies  b: baselines",
+        Style::new().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The title-bar badge for anomalies that appeared since the explorer was last opened.
+fn badge_text(b: &super::anomalies::Badge) -> String {
+    format!(
+        " ! {} new anomal{} ({} active, worst {}) ",
+        b.new,
+        if b.new == 1 { "y" } else { "ies" },
+        b.active,
+        b.worst_new.label()
+    )
 }
 
 fn gauge(f: &mut Frame, area: Rect, label: String, r: Option<f64>) {
@@ -270,7 +302,27 @@ fn dim_if_na(text: String) -> Cell<'static> {
     }
 }
 
-fn process_row(r: &ProcessRow) -> Row<'static> {
+/// The anomaly column: the worst active anomaly for this process id, as a coloured letter.
+fn anomaly_cell(severity: Option<winperf_core::anomaly::Severity>) -> Cell<'static> {
+    use winperf_core::anomaly::Severity;
+    match severity {
+        None => Cell::from("-").style(Style::new().fg(Color::DarkGray)),
+        Some(s) => {
+            let letter = match s {
+                Severity::Informational => "I",
+                Severity::Warning => "W",
+                Severity::High => "H",
+                Severity::Critical => "C",
+            };
+            Cell::from(letter).style(super::anomalies::severity_style(s))
+        }
+    }
+}
+
+fn process_row(
+    r: &ProcessRow,
+    anomalies: &std::collections::HashMap<u32, winperf_core::anomaly::Severity>,
+) -> Row<'static> {
     Row::new(vec![
         Cell::from(r.key.pid.to_string()),
         Cell::from(r.name.clone()),
@@ -278,8 +330,7 @@ fn process_row(r: &ProcessRow) -> Row<'static> {
         dim_if_na(fmt_memory(&r.memory)),
         dim_if_na(fmt_rate(&r.io)),
         dim_if_na(fmt_rate(&r.network)),
-        // Anomaly detection arrives in a later phase; the column is reserved.
-        Cell::from("-").style(Style::new().fg(Color::DarkGray)),
+        anomaly_cell(anomalies.get(&r.key.pid).copied()),
     ])
 }
 
@@ -287,7 +338,12 @@ fn draw_processes(f: &mut Frame, area: Rect, app: &mut App) {
     app.page_size = usize::from(area.height.saturating_sub(3)).max(1);
     app.sync_table();
 
-    let rows: Vec<Row> = app.sorted().into_iter().map(process_row).collect();
+    let marks = app.anomalies.active_by_pid();
+    let rows: Vec<Row> = app
+        .sorted()
+        .into_iter()
+        .map(|r| process_row(r, &marks))
+        .collect();
     let title = format!(
         " Processes ({}) - sorted by {} {} ",
         app.process_count(),

@@ -10,23 +10,23 @@ type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
 const MS_PER_HOUR: i64 = 3_600_000;
 
-fn at(ms: i64) -> String {
+pub(crate) fn at(ms: i64) -> String {
     unix_millis_to_utc_string(ms).unwrap_or_else(|| "unknown time".into())
 }
 
-fn value(a: &StoredAnomaly, v: f64) -> String {
+pub(crate) fn value(a: &StoredAnomaly, v: f64) -> String {
     format::value(a.resource, a.kind, v)
 }
 
 /// What the event is about: the resource, or "memory growth" for a potential leak.
-fn what(a: &StoredAnomaly) -> &'static str {
+pub(crate) fn what(a: &StoredAnomaly) -> &'static str {
     match (a.resource, a.kind) {
         (Resource::Memory, AnomalyKind::MemoryGrowth) => "mem-growth",
         (r, _) => r.as_str(),
     }
 }
 
-fn deviation(pct: f64) -> String {
+pub(crate) fn deviation(pct: f64) -> String {
     format!("{pct:+.0}%")
 }
 
