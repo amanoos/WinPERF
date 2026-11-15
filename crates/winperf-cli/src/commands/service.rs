@@ -303,6 +303,29 @@ pub fn status(out: &mut impl Write) -> Result<(), String> {
     )
 }
 
+/// What the service is doing, without needing administrator rights: `None` when it is not
+/// installed or the service manager cannot be asked.
+pub fn current_state() -> Option<ServiceState> {
+    let manager = manager(ServiceManagerAccess::CONNECT).ok()?;
+    let service = open(&manager, ServiceAccess::QUERY_STATUS).ok()??;
+    state_of(&service).ok()
+}
+
+/// One phrase for the service's state, for status screens.
+pub fn state_phrase(state: Option<ServiceState>) -> &'static str {
+    match state {
+        None => "service not installed",
+        Some(s) => match describe(s) {
+            "running" => "service running",
+            "stopped" => "service stopped",
+            "starting" => "service starting",
+            "stopping" => "service stopping",
+            "paused" => "service paused",
+            _ => "service resuming",
+        },
+    }
+}
+
 fn describe(state: ServiceState) -> &'static str {
     match state {
         ServiceState::Running => "running",

@@ -257,6 +257,8 @@ enum MonitorAction {
         #[arg(long)]
         no_network: bool,
     },
+    /// Is something recording, how fresh and continuous is the data (safe while the service runs)
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -376,6 +378,21 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 &mut std::io::stdout().lock(),
             )
             .map_err(io)
+        }
+        Command::Monitor {
+            action: MonitorAction::Status,
+        } => {
+            let db_path = resolve_db_path(cli.db.clone(), config.storage.database.as_deref());
+            let db = Database::open_read_only(&db_path).map_err(|e| e.to_string())?;
+            commands::status::show(
+                &db,
+                &db_path,
+                config.monitor.interval_secs,
+                commands::service::state_phrase(commands::service::current_state()),
+                unix_millis_now(),
+                &mut std::io::stdout().lock(),
+            )
+            .map_err(|e| e.to_string())
         }
         Command::Monitor {
             action:
@@ -573,7 +590,8 @@ fn run(cli: Cli, config: Config) -> Result<(), String> {
                 .with_anomalies(anomaly_source, anomalies && !baselines)
                 .with_inventory(inventory_source, matches!(screen, Some(Screen::Software)))
                 .with_history(history_source, matches!(screen, Some(Screen::History)))
-                .with_settings(settings_source, matches!(screen, Some(Screen::Settings)));
+                .with_settings(settings_source, matches!(screen, Some(Screen::Settings)))
+                .with_service_watch();
             if snapshot {
                 let text = tui::snapshot(&feed, app, 2, width, height).map_err(io)?;
                 print!("{text}");

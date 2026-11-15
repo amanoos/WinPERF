@@ -135,6 +135,61 @@ pub struct Status {
     pub unreadable: usize,
 }
 
+/// Whether the Windows service is running, checked now and then so the dashboard can say whether
+/// something is recording while it watches. The dashboard itself never writes to the database:
+/// it samples the machine for its own screen and reads stored results.
+pub struct ServiceWatch {
+    enabled: bool,
+    running: Option<bool>,
+    checked: Option<std::time::Instant>,
+}
+
+impl ServiceWatch {
+    const EVERY: Duration = Duration::from_secs(10);
+
+    /// Never asks the service manager (tests, and anywhere the answer is not wanted).
+    pub fn off() -> Self {
+        Self {
+            enabled: false,
+            running: None,
+            checked: None,
+        }
+    }
+
+    pub fn watching() -> Self {
+        Self {
+            enabled: true,
+            ..Self::off()
+        }
+    }
+
+    /// Ask again if the last answer is old. Returns whether the answer changed.
+    pub fn refresh_if_due(&mut self) -> bool {
+        if !self.enabled || self.checked.is_some_and(|t| t.elapsed() < Self::EVERY) {
+            return false;
+        }
+        self.checked = Some(std::time::Instant::now());
+        let now = Some(
+            crate::commands::service::current_state()
+                == Some(windows_service::service::ServiceState::Running),
+        );
+        let changed = now != self.running;
+        self.running = now;
+        changed
+    }
+
+    /// Words for the title bar and whether they are good news; `None` until the first answer.
+    pub fn label(&self) -> Option<(&'static str, bool)> {
+        self.running.map(|running| {
+            if running {
+                ("service recording", true)
+            } else {
+                ("service not running", false)
+            }
+        })
+    }
+}
+
 pub struct App {
     rows: HashMap<ProcessKey, ProcessRow>,
     pub system: Option<SystemSample>,
@@ -158,6 +213,7 @@ pub struct App {
     pub inventory: InventoryView,
     pub history: HistoryView,
     pub settings: SettingsView,
+    pub service: ServiceWatch,
 }
 
 impl App {
@@ -182,6 +238,7 @@ impl App {
             inventory: InventoryView::new(None),
             history: HistoryView::new(None),
             settings: SettingsView::new(None),
+            service: ServiceWatch::off(),
         }
     }
 
@@ -224,11 +281,19 @@ impl App {
     /// Re-read whatever the visible database-backed screen shows, if it is old. Returns whether
     /// the screen changed.
     pub fn refresh_screens_if_due(&mut self) -> bool {
-        match self.view {
+        let service = self.service.refresh_if_due();
+        let screen = match self.view {
             View::Inventory => self.inventory.refresh_if_due(),
             View::History => self.history.refresh_if_due(),
             _ => false,
-        }
+        };
+        service || screen
+    }
+
+    /// Show in the title bar whether the service is recording.
+    pub fn with_service_watch(mut self) -> Self {
+        self.service = ServiceWatch::watching();
+        self
     }
 
     /// Use a configuration that was just saved: the Baseline Explorer takes the new windows and

@@ -2,6 +2,7 @@
 //! attribution, assembled from the configuration. `winperf monitor run` and the Windows service
 //! both call [`run_configured`], so they behave identically.
 
+pub mod lock;
 pub mod monitor;
 pub mod schedule;
 
@@ -43,6 +44,9 @@ pub fn run_configured(
     out: &mut impl Write,
     note: &mut dyn FnMut(&str),
 ) -> Result<u64, Box<dyn std::error::Error>> {
+    // Only one recorder may write to a database: the service and a foreground monitor (or two
+    // of either) would otherwise interleave their samples. The lock ends with the process.
+    let _recorder = lock::RecorderLock::acquire(db_path)?;
     let interval = settings
         .interval_secs
         .unwrap_or(config.monitor.interval_secs);

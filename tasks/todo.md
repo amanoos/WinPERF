@@ -200,7 +200,13 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - AC: commands need and detect admin; delayed auto-start configurable; recovery restarts on failure; idempotent install/uninstall.
   - Verify: install → reboot test → running; kill process → restarts; uninstall leaves DB intact.
   - Deps: T24. Files: `cli/commands/service.rs`.
-- [ ] **T26: Service/TUI coexistence + health + crash recovery** (M)
+- [x] **T26: Service/TUI coexistence + health + crash recovery** (M)
+  - Done. Single recorder: `run_configured` takes a lock file `<database>.lock` (`runtime/lock.rs`, std file lock) for the whole run, so the service and `monitor run` (or two of either) can never write to one database; the second says who has it and suggests `winperf tui`. The OS releases the lock when the process ends, even when killed. The dashboard never writes to the database (it samples for its own screen and reads stored results), so it needs no mode switch; its title bar now says `service recording` (green) or `service not running` (yellow), asked of the service manager every 10 s.
+  - `winperf monitor status`: service state, database size (file plus write-ahead log), last system sample and whether that means recording (older than 3 intervals = NOT recording), the last 24 h (samples vs expected between first and last sample, number of gaps over 3 intervals, longest gap), active anomalies, profiling state. Read-only. Error counts are not kept anywhere, so gaps stand in for them.
+  - Profile control path: `profile start/stop` write the `profile_state` table; the recorder reads it every 5 minutes with the baselines (so a change reaches a running service within 5 minutes, and `monitor status` says so).
+  - Crash recovery: instances still open from a killed run are closed at the first tick of the next run (already existed). Live check: ran `winperf-service run` on a scratch database, a second recorder was refused, `monitor status` said recording, `taskkill /F` mid-run left `integrity_check` ok, a planted open ghost instance got an end time on restart, and the lock was free again. Up to about 6 ticks (30 s) of samples can be lost to a kill, by design (batched writes).
+  - Also fixed a flaky runtime test (stale temp folder from an earlier run with the same process id).
+  - Not done: the real service was not killed this time (T25's recovery restart is still to be watched in Checkpoint 5).
   - AC: TUI detects running service and becomes read-only viewer of the DB (never a second writer); `monitor status` reports last sample time, error counts, DB size; control path for `profile start/stop` is defined (config table polled by service); unclean shutdown leaves DB valid and open process instances closed on next start.
   - Verify: kill -9 the service mid-write → restart, integrity_check ok; TUI + service run together.
   - Deps: T25, T18.

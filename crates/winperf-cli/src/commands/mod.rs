@@ -9,4 +9,5 @@ pub mod process;
 pub mod profile;
 pub mod report;
 pub mod service;
+pub mod status;
 pub mod system;

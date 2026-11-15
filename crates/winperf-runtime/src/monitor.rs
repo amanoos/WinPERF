@@ -247,6 +247,8 @@ mod tests {
     #[test]
     fn run_records_samples_and_stops_after_the_requested_ticks() {
         let dir = std::env::temp_dir().join(format!("winperf-cli-monitor-{}", std::process::id()));
+        // A folder left by an earlier run with the same process id would add its samples.
+        let _ = std::fs::remove_dir_all(&dir);
         let db_path = dir.join("m.db");
         let script = Script(vec![vec![obs(1), obs(2)], vec![obs(1), obs(2)]].into());
         let stop = AtomicBool::new(false);
@@ -272,6 +274,7 @@ mod tests {
 
         let db = Database::open(&db_path).unwrap();
         assert_eq!(db.sample_count().unwrap(), 4);
+        drop(db); // an open file cannot be deleted on Windows
         let _ = std::fs::remove_dir_all(&dir);
     }
 

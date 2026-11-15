@@ -209,9 +209,80 @@ impl Database {
     }
 }
 
+/// How continuous the recording has been over a period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleHealth {
+    /// System samples in the period.
+    pub samples: i64,
+    /// Time of the first and last of them.
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+    /// Interruptions: places where consecutive samples are further apart than the allowed gap.
+    pub gaps: i64,
+    /// The longest such interruption in milliseconds (0 when there were none).
+    pub longest_gap_ms: i64,
+}
+
+impl Database {
+    /// Continuity of the system samples since `since_ms`: how many, and how many gaps longer than
+    /// `gap_ms` (the monitor was stopped, the machine slept, or sampling failed).
+    pub fn sample_health(&self, since_ms: i64, gap_ms: i64) -> Result<SampleHealth> {
+        let (samples, first, last, gaps, longest): (i64, Option<i64>, Option<i64>, i64, i64) =
+            self.conn().query_row(
+                "SELECT COUNT(*), MIN(ts_ms), MAX(ts_ms), \
+                    COALESCE(SUM(d > ?2), 0), \
+                    COALESCE(MAX(CASE WHEN d > ?2 THEN d END), 0) \
+             FROM (SELECT ts_ms, ts_ms - LAG(ts_ms) OVER (ORDER BY ts_ms) AS d \
+                   FROM system_samples WHERE ts_ms >= ?1)",
+                params![since_ms, gap_ms],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        Ok(SampleHealth {
+            samples,
+            first_ts_ms: first,
+            last_ts_ms: last,
+            gaps,
+            longest_gap_ms: longest,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaps_between_samples_are_counted_and_the_longest_reported() {
+        let db = Database::open_in_memory().unwrap();
+        // 5 s apart, then a 60 s hole, then 5 s apart, then a 20 s hole.
+        for ts in [0, 5_000, 10_000, 70_000, 75_000, 95_000] {
+            db.conn()
+                .execute(
+                    "INSERT INTO system_samples (ts_ms) VALUES (?1)",
+                    params![ts],
+                )
+                .unwrap();
+        }
+        let h = db.sample_health(0, 15_000).unwrap();
+        assert_eq!(
+            h,
+            SampleHealth {
+                samples: 6,
+                first_ts_ms: Some(0),
+                last_ts_ms: Some(95_000),
+                gaps: 2,
+                longest_gap_ms: 60_000
+            }
+        );
+        // Only the later samples count when the period starts later.
+        let later = db.sample_health(70_000, 15_000).unwrap();
+        assert_eq!(
+            (later.samples, later.gaps, later.longest_gap_ms),
+            (3, 1, 20_000)
+        );
+        let none = db.sample_health(1_000_000, 15_000).unwrap();
+        assert_eq!((none.samples, none.gaps), (0, 0));
+    }
 
     #[test]
     fn system_samples_can_be_read_for_a_time_range() {

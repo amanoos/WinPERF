@@ -141,6 +141,12 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    if let Some((text, good)) = app.service.label() {
+        spans.push(Span::styled(
+            format!("{text} "),
+            Style::new().fg(if good { Color::Green } else { Color::Yellow }),
+        ));
+    }
     spans.push(Span::raw(format!("Overview ({}s)", app.interval.as_secs())));
     spans.push(Span::styled(
         "  e anomalies  b baselines  w software  h history  s settings",

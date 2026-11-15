@@ -17,7 +17,7 @@ pub use paths::{
 };
 pub use repo::{
     AnomalyFilter, ExecutableRow, FileIdentity, ListedBaseline, ProfileState, RecomputeReport,
-    StoredAnomaly, StoredBaseline, StoredSystemSample,
+    SampleHealth, StoredAnomaly, StoredBaseline, StoredSystemSample,
 };
 pub use sink::DbSink;
 
