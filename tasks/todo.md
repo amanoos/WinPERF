@@ -119,7 +119,12 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - Deps: T17, T15. Files: `core/profiler/confidence.rs`, `cli/commands/profile.rs`, `cli/tui/baselines.rs`.
 
 ### Checkpoint 3: Baselines
-- [ ] After a multi-hour run, baselines look sane for known processes (e.g. browser, explorer) and "Insufficient" for new ones. Human spot-check.
+- [x] After a multi-hour run, baselines look sane for known processes (e.g. browser, explorer) and "Insufficient" for new ones. Human spot-check.
+  - 4 h elevated soak (240 samples at 5 s, 16 logical cores): avg 0.80% of one core (max 19.48%), RSS 29.1 -> 29.0 MB (peak 35.6 MB), DB 201.5 MB.
+  - `baseline update` over all three windows took 7.3 s (4 h of data, 179 subjects, 1039 rows). Consistent with the ~0.8 s per hour of samples estimate; multi-day cost is still unmeasured.
+  - Summary: 179 subjects, 0 High, 142 Established, 11 Preliminary, 26 Insufficient. Long-running processes (chrome, dwm, explorer, msedge) are Established with plausible numbers (explorer 660 MiB, 0.29% CPU, +2.3 MiB/h; dwm 153 MiB, flat).
+  - Caveat: chrome.exe memory shows 27.4 GiB because instances are summed per tick and working set double-counts shared pages. Fine for self-baselines, misleading as an absolute figure. Consider private bytes as the displayed memory metric.
+  - Minor: `profile status` has no `--window` flag (reports the longest window only).
 
 ## Phase 4: Anomaly Detection
 
