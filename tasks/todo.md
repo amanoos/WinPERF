@@ -304,7 +304,11 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - AC: DB/dir ACL restricted to SYSTEM/Administrators/owner; command lines stored behind a config flag with secret-pattern redaction (`--password`, tokens); localhost binding verified; no outbound connections (verified with a netstat/ETW check); `cargo audit` clean.
   - Verify: inspect ACLs; test redaction patterns; run `cargo audit`.
   - Deps: T34.
-- [ ] **T36: Performance validation + docs** (S)
+- [~] **T36: Performance validation + docs** (S)
+  - Docs done: `README.md`, `docs/install-and-usage.md` (build, first time, service, report, every command, the configuration table, where things are, the first days, uninstall), `docs/limitations.md` (per-metric attribution caveats per PRD 10.2, identity and classification, baselines and anomalies, history resolution, security and privacy, what is not built), `docs/performance.md`.
+  - Measured (12 minutes of `monitor run`, `scripts\soak.ps1`, 16 cores, about 525 processes, no administrator rights, 5 s interval): CPU 0.70 % of one core after start-up (0.04 % of the machine), against the preferred under 1 %; memory about 26 MB (24.5 to 26.3, flat), against under 100 MB; one batched transaction per tick, about 80 MB an hour written; the first minute averaged 23 % of one core (one-off signature verification, cached afterwards); raw growth about 0.7 MB a minute. Estimated steady state about 5 GB on a machine this busy. New `scripts\overhead.ps1` attaches to an already running process (the service) and records CPU, memory, handles, database growth and bytes written a minute for N hours; tested for 3 minutes against the soak's process.
+  - OPEN, needs the human and time: the 24 hour run of the installed service (`winperf service install`, then `.\scripts\overhead.ps1 -Hours 24` in a second window; paste the summary into `docs/performance.md`), which is also Checkpoint 5's run, and the fresh-machine install walkthrough (no second machine here; the guide was written from the commands and checked against `--help`).
+  - (Original AC below.)
   - AC: 24 h run with actual overhead numbers (CPU, RSS, DB size, writes/s) vs NFR-001; `README`, limitations doc (metric attribution caveats per 10.2), install/usage guide.
   - Verify: numbers recorded in docs; fresh-machine install walkthrough.
   - Deps: T35.
