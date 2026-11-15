@@ -666,3 +666,51 @@ async fn rankings_export_matches_the_ranking_api() {
     let (code, _, _) = raw(&app, "/api/export/rankings?metric=gpu").await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn a_busy_report_does_not_stop_the_recorder_writing() {
+    let s = Scratch::new();
+    seed(&s.db());
+    let app = app(settings(s.db(), None));
+    let path = s.db();
+    // The recorder: its own connection, one transaction per tick, every commit timed.
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut db = Database::open(&path).unwrap();
+        let mut slowest = std::time::Duration::ZERO;
+        for i in 0..60 {
+            let started = std::time::Instant::now();
+            let tx = db.conn_mut().transaction().unwrap();
+            tx.execute(
+                "INSERT INTO system_samples (ts_ms, cpu_percent) VALUES (?1, 1.0)",
+                [unix_millis_now() + 10_000 + i],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            slowest = slowest.max(started.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        slowest
+    });
+    // The report: many requests at once while that goes on.
+    let now = unix_millis_now();
+    let range = format!("from_ms={}&to_ms={}", now - 700_000, now + 1);
+    let mut readers = Vec::new();
+    for i in 0..40 {
+        let app = app.clone();
+        let uri = match i % 4 {
+            0 => format!("/api/system?{range}"),
+            1 => format!("/api/rankings?metric=cpu&{range}"),
+            2 => format!("/api/export/history?{range}"),
+            _ => "/api/anomalies".to_string(),
+        };
+        readers.push(tokio::spawn(async move { local(&app, &uri).await.0 }));
+    }
+    for r in readers {
+        assert_eq!(r.await.unwrap(), StatusCode::OK);
+    }
+    let slowest = writer.await.unwrap();
+    assert!(
+        slowest < std::time::Duration::from_secs(1),
+        "a commit took {slowest:?} while the report was being read"
+    );
+}

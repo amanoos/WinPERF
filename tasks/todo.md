@@ -267,7 +267,12 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - AC: export rankings, history range, anomalies; large ranges streamed; command-line-injection-safe CSV (escape leading `=+-@`).
   - Verify: export round-trips; formula-injection test.
   - Deps: T31.
-- [ ] **T33: Report/monitor non-interference check** (S)
+- [x] **T33: Report/monitor non-interference check** (S)
+  - Done. Why it holds: the database is in WAL mode (readers never block the writer and the writer never blocks readers), the report opens it read-only per request, and the writer has a 5 s busy timeout. Measured with `cargo run --release -p winperf-report --example interference -- <db copy> <report port> [secs]` (`examples/interference.rs`): it plays the recorder against a COPY (a 215 MiB database with 4 M process samples), one transaction per tick with a system sample and 200 process samples, every commit timed, first alone and then while 4 threads repeat the page's heaviest requests (24 h system history, two 24 h rankings, a streamed history export, anomalies, current).
+  - Results (tick every 250 ms, 20x faster than the real 5 s): alone p50 0.9 ms, p99 2.8 ms, max 12 ms; with the report under load p50 1.0 ms, p99 5.1 ms, max 11.5 ms; 137 requests answered, none failed; WAL 11 MiB afterwards (it is checkpointed, not growing without bound). A real tick is 5 s, so the worst commit under load used under 0.3 % of it.
+  - Regression test `a_busy_report_does_not_stop_the_recorder_writing`: 40 concurrent requests (system, rankings, export, anomalies) against 60 timed commits; every request answers 200 and no commit takes a second.
+  - Not covered: the real recorder's cadence under a disk that is itself busy, and a report left open for days (WAL checkpoint behaviour over long reads: each request holds its read transaction only for its own duration); both belong to the 24 h run in Checkpoint 5.
+  - (Original AC below.)
   - AC: report queries do not block service writes (WAL, busy timeout, read-only); measured write latency with report under load.
   - Verify: load test with concurrent dashboard polling; sample cadence unaffected.
   - Deps: T32.
