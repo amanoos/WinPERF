@@ -96,6 +96,31 @@ impl Database {
         self.recompute_baselines_from(now_ms, window_hours, None)
     }
 
+    /// The rollup width to compute a window from, or `None` to read raw ticks. Windows of a day or
+    /// more use the 1-minute rollups once they are caught up (about 12 times fewer rows than raw
+    /// ticks, so the hourly recompute no longer sorts millions of rows through temporary files,
+    /// which measured at 0.5 to 2 GB written a time); so does any window longer than the raw
+    /// retention, which raw ticks no longer cover. A database whose rollups are missing or still
+    /// catching up reads raw ticks for a window the raw samples still cover.
+    pub fn baseline_rollup(
+        &self,
+        now_ms: i64,
+        window_hours: u32,
+        raw_days: u32,
+    ) -> Result<Option<i64>> {
+        const ROLLUP_FROM_HOURS: u32 = 24;
+        if window_hours > raw_days.saturating_mul(24) {
+            return Ok(Some(60_000));
+        }
+        if window_hours < ROLLUP_FROM_HOURS || !self.has_rollups() {
+            return Ok(None);
+        }
+        let caught_up = self
+            .rolled_up_until()?
+            .is_some_and(|t| t >= now_ms - 10 * 60_000);
+        Ok(caught_up.then_some(60_000))
+    }
+
     /// Like [`Self::recompute_baselines`], but with `Some(res_ms)` the points are the rollup
     /// buckets of that width (the average over each bucket) instead of raw ticks. This is how a
     /// window longer than the raw retention is computed: the raw samples no longer cover it.

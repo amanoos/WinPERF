@@ -18,8 +18,8 @@ pub fn update(
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for &hours in windows {
-        // A window longer than the raw samples are kept comes from the 1-minute rollups.
-        let rollup = (hours > raw_days.saturating_mul(24)).then_some(60_000);
+        // Windows of a day or more come from the 1-minute rollups when they are caught up.
+        let rollup = db.baseline_rollup(now_ms, hours, raw_days)?;
         let r = db.recompute_baselines_from(now_ms, hours, rollup)?;
         writeln!(
             out,

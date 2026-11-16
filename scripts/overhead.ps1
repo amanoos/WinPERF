@@ -38,8 +38,13 @@ try {
         $prevCpu = $cpu; $prevT = $now
         # Bytes the process has written so far (all its I/O, which for this program is the database).
         $io = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)").WriteTransferCount
-        "{0:s},{1:N2},{2:N3},{3:N1},{4:N1},{5},{6:N1},{7:N1}" -f $now, $one, ($one / $cores), ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB), $p.HandleCount, ((Db-Bytes) / 1MB), ($io / 1MB) |
-            Add-Content $Csv
+        # F formats (no thousands separators, invariant culture) keep each value one CSV field.
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $row = [string]::Format($inv, "{0:s},{1:F2},{2:F3},{3:F1},{4:F1},{5},{6:F1},{7:F1}", $now, $one, ($one / $cores), ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB), $p.HandleCount, ((Db-Bytes) / 1MB), ($io / 1MB))
+        # A scanner or backup can hold the file for a moment: retry rather than end the run.
+        for ($try = 0; $try -lt 5; $try++) {
+            try { Add-Content $Csv $row -ErrorAction Stop; break } catch { Start-Sleep -Seconds 2 }
+        }
     }
 }
 finally {
@@ -62,7 +67,7 @@ finally {
             ("database (with wal) : {0:N1} MB now, {1:N1} MB change over the run" -f [double]$rows[-1].db_mb, $dbGrowth)
             ("bytes written       : {0:N1} MB over the run = {1:N2} MB/hour" -f $written, ($written / [math]::Max($elapsed, 0.01)))
         )
-        $text | Write-Host
+        $text | Write-Host   # (summary uses the current culture's numbers; only the CSV is invariant)
         $text | Set-Content ($Csv -replace "\.csv$", "-summary.txt")
     }
 }

@@ -38,6 +38,15 @@ Per minute (CPU % of one core, working set MB, database MB including WAL): 1: 23
 - **Catch-up after upgrading** (T34): the first maintenance pass rolls up and prunes the raw
   samples; measured 10 s per 300 MiB of database (`winperf maintain` does it at once).
 
+- **A long run found an hourly write spike, now fixed** (T36). A 24-hour run of the installed
+  service (about 17 hours of usable rows; see the note in `tasks/todo.md`) showed the service at
+  0.5 to 1.0 % of one core and about 33 MB, with flat handles and no gaps in the data. But once an
+  hour, when the 24-hour baseline was recomputed from raw samples, it wrote 0.5 to 2 GB and used
+  12 to 35 % of one core for about a minute, growing with the database (about 1.6 GB an hour in all).
+  The sort spilled to temporary files. The 24-hour baseline is now computed from the 1-minute
+  rollups once they are caught up. On a 1.6 GB copy of the real database the full baseline update
+  went from 26 s and about 2.2 GB written to 4.9 s and about 0.33 GB.
+
 ## Sizing
 
 Retention (2 days raw, 14 days of 1-minute rows, 180 days of 15-minute rows) bounds the file; it stops

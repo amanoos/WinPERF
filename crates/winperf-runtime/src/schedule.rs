@@ -77,7 +77,7 @@ fn recompute(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now = unix_millis_now();
     for &hours in windows {
-        let rollup = (hours > raw_days.saturating_mul(24)).then_some(60_000);
+        let rollup = db.baseline_rollup(now, hours, raw_days)?;
         db.recompute_baselines_from(now, hours, rollup)?;
     }
     Ok(())

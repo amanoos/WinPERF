@@ -170,7 +170,7 @@ impl HistorySource {
 
 impl Database {
     /// Whether this database has the rollup tables (an older one opened read-only may not).
-    fn has_rollups(&self) -> bool {
+    pub(crate) fn has_rollups(&self) -> bool {
         self.conn()
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'system_rollups'",
@@ -930,6 +930,25 @@ mod tests {
             .find(|r| r.metric == BaselineMetric::Cpu)
             .unwrap();
         assert!(raw.observations < 1500, "{}", raw.observations);
+    }
+
+    #[test]
+    fn a_day_window_uses_the_rollups_only_once_they_are_caught_up() {
+        let (db, now) = three_days_with_one_raw();
+        // Caught up: a day or more reads the 1-minute rollups, an hour reads raw ticks.
+        assert_eq!(db.baseline_rollup(now, 24, 2).unwrap(), Some(60_000));
+        assert_eq!(db.baseline_rollup(now, 168, 2).unwrap(), Some(60_000));
+        assert_eq!(db.baseline_rollup(now, 1, 2).unwrap(), None);
+        // A window beyond the raw retention always needs the rollups.
+        assert_eq!(db.baseline_rollup(now, 72, 2).unwrap(), Some(60_000));
+        // An hour later with no maintenance pass in between the rollups are behind: raw ticks.
+        assert_eq!(db.baseline_rollup(now + 3_600_000, 24, 2).unwrap(), None);
+        // No rollup tables at all: raw ticks.
+        let old = Database::open_in_memory().unwrap();
+        old.conn()
+            .execute_batch("DROP TABLE system_rollups; DROP TABLE process_rollups;")
+            .unwrap();
+        assert_eq!(old.baseline_rollup(now, 24, 2).unwrap(), None);
     }
 
     #[test]

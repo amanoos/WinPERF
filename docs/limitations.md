@@ -45,8 +45,9 @@ turned into zero, and charts leave a gap rather than drawing a flat line.
 - **Severity** comes from how much pressure the machine is under at the time and how much of it the
   program accounts for, not from how unusual the program is alone. A big deviation on an idle
   machine can rate lower than a small one on a machine out of memory.
-- The 7-day baseline is computed from the 1-minute averages (raw samples only cover 2 days), so it
-  is slightly smoother than the shorter ones.
+- The 24-hour and 7-day baselines are computed from the 1-minute averages (the 7-day one has to,
+  as raw samples only cover 2 days; the 24-hour one does it to keep the hourly recompute cheap), so
+  they are slightly smoother than the 1-hour one, which uses the raw samples.
 
 ## History and resolution
 
