@@ -212,7 +212,10 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - Deps: T25, T18.
 
 ### Checkpoint 5: Unattended
-- [ ] 24 h unattended run via service; terminal closed throughout; data continuous; overhead targets hold.
+- [x] 24 h unattended run via service; terminal closed throughout; data continuous; overhead targets hold.
+  - Two 24 h runs of the installed service (2026-11-15/16 and 2026-11-16/17): no gaps (`monitor status` 100 % of expected samples), memory about 32 MB, handles flat; the first run found the hourly write spike, fixed before the second (see T36). Whole-day CPU of the final build not measured (T36).
+  - Kill-restart check 2026-11-17: the user force-ended `winperf-service.exe` from an elevated prompt; Windows restarted it (new pid), recording resumed, and `monitor status` showed one gap, 18 s, in the last 24 h.
+  - Not done: reboot with nobody logged in (sampling before logon). Say so in the go/no-go if it stays untested.
 
 ## Phase 6: Browser Reporting
 
