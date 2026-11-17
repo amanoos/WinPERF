@@ -24,7 +24,13 @@ function Db-Bytes { (Get-ChildItem "$Db*" -ErrorAction SilentlyContinue | Measur
 "time,cpu_pct_of_one_core,cpu_pct_of_machine,rss_mb,private_mb,handles,db_mb,io_write_mb_total" | Set-Content $Csv
 $start = Get-Date
 $end = $start.AddHours($Hours)
-$prevCpu = $p.TotalProcessorTime.TotalSeconds
+# CPU time comes from the CIM process record: Process.TotalProcessorTime is not readable for a
+# SYSTEM-owned service from a normal prompt (it came back empty, so every row read 0.00).
+function Proc-Info { Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" }
+function Cpu-Seconds($i) { ([double]$i.KernelModeTime + [double]$i.UserModeTime) / 1e7 }
+$first = Proc-Info
+if (-not $first) { throw "cannot read process $($p.Id)" }
+$prevCpu = Cpu-Seconds $first
 $prevT = $start
 $dbStart = Db-Bytes
 try {
@@ -33,11 +39,13 @@ try {
         $p.Refresh()
         if ($p.HasExited) { Write-Warning "the process exited"; break }
         $now = Get-Date
-        $cpu = $p.TotalProcessorTime.TotalSeconds
+        $info = Proc-Info
+        if (-not $info) { Write-Warning "the process exited"; break }
+        $cpu = Cpu-Seconds $info
         $one = 100 * ($cpu - $prevCpu) / ($now - $prevT).TotalSeconds
         $prevCpu = $cpu; $prevT = $now
         # Bytes the process has written so far (all its I/O, which for this program is the database).
-        $io = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)").WriteTransferCount
+        $io = $info.WriteTransferCount
         # F formats (no thousands separators, invariant culture) keep each value one CSV field.
         $inv = [Globalization.CultureInfo]::InvariantCulture
         $row = [string]::Format($inv, "{0:s},{1:F2},{2:F3},{3:F1},{4:F1},{5},{6:F1},{7:F1}", $now, $one, ($one / $cores), ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB), $p.HandleCount, ((Db-Bytes) / 1MB), ($io / 1MB))

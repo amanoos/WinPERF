@@ -46,6 +46,16 @@ Per minute (CPU % of one core, working set MB, database MB including WAL): 1: 23
   The sort spilled to temporary files. The 24-hour baseline is now computed from the 1-minute
   rollups once they are caught up. On a 1.6 GB copy of the real database the full baseline update
   went from 26 s and about 2.2 GB written to 4.9 s and about 0.33 GB.
+- **A clean 24-hour run of the fixed service** (2026-11-16 18:00 to 2026-11-17 18:00, 1,427
+  one-minute rows, one writer): no gaps (`monitor status`: 17,276 of 17,276 samples), memory 31.8 MB
+  on average and 37.8 MB at most, handles flat (about 290 to 390), database 1,644 to 2,945 MB (about
+  54 MB an hour while raw samples fill their 2 days), 13.1 GB written in all (546 MB an hour). The
+  spike is much smaller but not gone: the median minute writes 2.7 MB; the hourly recompute minute
+  writes about 190 MB and the one every 7 hours (the 7-day window) up to 443 MB, against 0.5 to 2 GB
+  an hour before. Those 24 minutes are most of the writes. **CPU was not recorded in this run**: the
+  script read an empty value for a SYSTEM-owned process (fixed since); a 3-minute check with the
+  fixed script read 0.6 % of one core. The CPU over a whole day on the fixed build is still to be
+  measured.
 
 ## Sizing
 
@@ -58,8 +68,10 @@ about 120 processes was 3.8 GB). Treat these as estimates until the long run bel
 
 ## Not yet measured
 
-- **A 24-hour run of the installed service.** Only 12 minutes were measured here. To record the real
-  numbers (CPU, memory, handles, database growth and bytes written, a row a minute):
+- **The CPU of the installed service over a whole day.** Memory, handles, growth and writes are
+  measured over 24 hours (above); the CPU column of that run was lost, so repeat the run once
+  (the script is fixed). To record the numbers (CPU, memory, handles, database growth and bytes
+  written, a row a minute):
 
   ```powershell
   winperf service install            # elevated, if not already installed
