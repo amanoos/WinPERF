@@ -68,10 +68,12 @@ about 120 processes was 3.8 GB). Treat these as estimates until the long run bel
 
 ## Not yet measured
 
-- **The CPU of the installed service over a whole day.** Memory, handles, growth and writes are
-  measured over 24 hours (above); the CPU column of that run was lost, so repeat the run once
-  (the script is fixed). To record the numbers (CPU, memory, handles, database growth and bytes
-  written, a row a minute):
+- **The CPU of the installed service over a whole day, on the final build: not measured.** Memory,
+  handles, growth and writes are measured over 24 hours (above); the CPU column of that run was
+  lost to a script bug (fixed). The evidence for CPU is a 24-hour run of the build before the
+  baseline change (about 0.5 to 1.0 % of one core between the hourly spikes, which the change only
+  makes smaller) and a 3-minute check of the final build (0.6 %). To measure it yourself (CPU,
+  memory, handles, database growth and bytes written, a row a minute):
 
   ```powershell
   winperf service install            # elevated, if not already installed
