@@ -41,7 +41,12 @@ turned into zero, and charts leave a gap rather than drawing a flat line.
   not know whether the cause is a fault, a big job you started, or an update. The sensitivity
   setting trades fewer, surer events against more, earlier ones.
 - **Memory growth** is flagged from a steady rise in private bytes without reclamation. That is a
-  *potential* leak, not proof: a program legitimately loading a large file looks the same.
+  *potential* leak, not proof: a program legitimately loading a large file looks the same. It looks
+  at the last 30 minutes only (at normal sensitivity), so it cannot see memory being given back
+  hours later. Known false positive: `dwm.exe` (the Windows desktop compositor) grows its private
+  memory in steps while you open windows and apps, then releases it later; on the development
+  machine that raised about two informational alerts a day, with the figure staying between 450 and
+  730 MiB. A leak keeps climbing; check the history chart before acting on one of these.
 - **Severity** comes from how much pressure the machine is under at the time and how much of it the
   program accounts for, not from how unusual the program is alone. A big deviation on an idle
   machine can rate lower than a small one on a machine out of memory.

@@ -180,7 +180,9 @@ Sizes: XS 1 file, S 1-2, M 3-5. Verification for every task includes the Definit
   - Deps: T15, T13.
 
 ### Checkpoint 4: Detection
-- [ ] PRD Phase 4 acceptance met on synthetic and live scenarios. False-positive review over a real day of use: tune defaults. Human sign-off on sensitivity presets.
+- [x] PRD Phase 4 acceptance met on synthetic and live scenarios. False-positive review over a real day of use: tune defaults. Human sign-off on sensitivity presets.
+  - Signed off 2026-11-17 at Normal. Two days of the installed service: 8 anomalies, all Informational (3 Chrome CPU events of 9 to 10 %, 5 `dwm.exe` memory-growth events); a replay of the threshold rules over the last 48 h gave low 0, normal 1, high 16 events (high flags routine Defender, Chrome and svchost CPU). A deliberate 4-minute CPU burn in `pwsh.exe` (baseline about 0 %) was raised as anomaly #9 at 24.5 % after the 2-minute sustain, with a correct explanation. A program with no baseline (`python.exe`) is not judged, by design.
+  - Known false positive, accepted: `dwm.exe` growth (usage-driven, reclaimed hours later, 450 to 730 MiB); noted in `docs/limitations.md`. Possible later changes: a longer leak window or a process ignore list.
   - Progress: memory-level rule now also needs `min_ratio x median` (Low 3x, Normal 2x, High 1.5x; other resources 1x) because working sets legitimately swing by tens of percent. Replaying the 19 events of the live run by hand: the Normal-sensitivity ones for Code.exe (+68%, +95%), node.exe (+61%), conhost.exe (+81%/+153% only when below 2x), explorer.exe (+22%) would no longer fire; only 2x-and-over rises remain (pwsh +545%/+627%, dllhost +290%, a 3.3 GiB Code at +110%). Synthetic scenarios (CPU, disk, memory level, leak, sawtooth) are covered by unit tests and live burner runs.
   - Still open (needs the human): run `winperf monitor run` for a real day at Normal sensitivity, review `winperf report --hours 24` for false positives, and sign off the presets.
 
