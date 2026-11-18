@@ -87,6 +87,7 @@ of the open items is a known defect; they are evidence not yet gathered.
 
 ## Decision
 
-- [ ] Go as a release candidate (own machine), conditions above
+- [x] Go as a release candidate (own machine), conditions above (decided 2026-11-17; the open items
+  above stay open, and wider distribution remains a no-go until they are closed)
 - [ ] Go after: ______________________
 - [ ] No-go: ______________________
